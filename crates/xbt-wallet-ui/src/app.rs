@@ -1096,6 +1096,13 @@ impl App {
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
         b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
                          ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() })]));
+        // the simple view: what can be spent, favorite shops, and where to go; the coins on chain and the rest are behind Advanced
+        if self.simple() {
+            b.push_str("<p class=\"small\">This is what you can spend in shops right now, within your <a href=\"./limits\">limits</a>.</p></div></section>");
+            b.push_str(&self.favorites_html(&self.services().unwrap_or_default()));
+            b.push_str("<p class=\"status-line\"><a class=\"button-link primary\" href=\"./browse\">Browse shops</a> · <a href=\"./activity\">What you paid: Activity</a></p>");
+            return self.page("Wallet", ctx, b);
+        }
         b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./services\">Sellers</a> and on each shop's service page \
                     (on <a href=\"./connections\">Live connections</a> while a connection is open). \
                     What the app may spend is in your <a href=\"./policy\">spending rules</a>.</p></div>");
@@ -1122,12 +1129,6 @@ impl App {
             b.push_str(&t);
         }
         b.push_str("</section>");
-        // the simple view: favorite shops under the balance, what was paid on its own page
-        if self.simple() {
-            b.push_str(&self.favorites_html(&self.services().unwrap_or_default()));
-            b.push_str("<p class=\"status-line\"><a class=\"button-link primary\" href=\"./browse\">Browse shops</a> · <a href=\"./activity\">What you paid: Activity</a></p>");
-            return self.page("Wallet", ctx, b);
-        }
         b.push_str(&self.activity_html(query, "./wallet"));
         b.push_str("<details class=\"card\"><summary>Technical details</summary>");
         b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),

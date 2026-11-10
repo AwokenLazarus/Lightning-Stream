@@ -6311,6 +6311,7 @@ fn the_simple_view_has_four_entries_and_advanced_puts_every_page_back() {
     assert!(menu.contains(">Advanced</button>"), "{menu}");
     assert!(wallet.contains("<body class=\"simple\">") && wallet.contains("<nav class=\"bottom-bar\""), "the bar at the bottom");
     assert!(wallet.contains("href=\"./activity\"") && !wallet.contains("<h2>Recent activity</h2>"), "the list of payments has its own page");
+    assert!(wallet.contains("Can send now") && !wallet.contains("XBT on chain"), "what can be spent, without the coins on chain");
     // Activity is a page, marked in the menu; the pages out of the menu still open
     let activity = br.get("/activity");
     assert_eq!(activity.status, 200);
