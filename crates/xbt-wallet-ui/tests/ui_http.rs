@@ -6549,3 +6549,12 @@ fn with_the_open_key_add_money_moves_the_deposit_and_opens_the_connection() {
 fn the_open_key_baked_is_the_one_the_signer_takes() {
     assert_eq!(xbt_wallet_ui::setup::OPEN_OPS, xbt_signer::ln_open::OPEN_OPS);
 }
+
+/// The suggested node is a node key and an address the signer takes, at both of its addresses.
+#[test]
+fn the_suggested_node_on_mainnet_is_one_the_signer_takes() {
+    use xbt_wallet_ui::app::{GENESIS_HOST, GENESIS_NODE, GENESIS_ONION};
+    assert!(xbt_signer::ln_open::valid_pubkey(GENESIS_NODE));
+    assert!(xbt_signer::ln_open::valid_host(GENESIS_HOST) && xbt_signer::ln_open::valid_host(GENESIS_ONION));
+    assert!(xbt_wallet_ui::config::funding_peer(&format!("{GENESIS_NODE}@{GENESIS_ONION}")).is_some());
+}

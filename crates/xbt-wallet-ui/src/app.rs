@@ -184,6 +184,12 @@ fn allow_seller(p: &mut Value, origin: &str, node: &str) -> Option<String> {
     Some(origin)
 }
 
+/// The node a mainnet box suggests for the first connection: Lightning Stream Genesis, the demo shop's node, with the two
+/// addresses it announces.
+pub const GENESIS_NODE: &str = "035d867908cdcdbccda8763bf81a99574dc042e2a6d00e44e9845836b7123d0b7d";
+pub const GENESIS_HOST: &str = "103.219.170.129:9735";
+pub const GENESIS_ONION: &str = "ywcqvtf3jcntadpjky46z7hwz3jx5jz43qa6m4qtqtczp5ab5wljxaad.onion:9735";
+
 /// The least a first deposit should be: under it a channel may not open, or leaves too little to spend.
 const MIN_DEPOSIT_SATS: i64 = 250_000;
 
@@ -788,7 +794,11 @@ impl App {
         }
         let mut b = String::from("<section class=\"card\" id=\"open-connection\"><h2>4. Open your connection</h2>");
         let human = self.human_pub();
-        let (peer, host) = self.cfg.funding_peer.clone().unwrap_or_default();
+        // the box's own choice, else on mainnet the demo shop's node (it has both addresses: the other is said below)
+        let genesis = self.cfg.funding_peer.is_none() && self.signer_chain() == "main";
+        let (peer, host) = self.cfg.funding_peer.clone()
+            .or_else(|| genesis.then(|| (GENESIS_NODE.to_string(), GENESIS_HOST.to_string()))).unwrap_or_default();
+        let other = if genesis { format!(" If it cannot be reached at that address, use its other one: <code class=\"mono\">{GENESIS_ONION}</code>.") } else { String::new() };
         for f in &forwards {
             let (txid, amount) = (txt(f.get("txid")), crate::html::group3(int(f.get("sats")).max(0) as u64));
             if f.get("channel").is_some() {
@@ -803,8 +813,9 @@ impl App {
                         <label>Node key<input name=\"peer\" value=\"{}\" class=\"mono\" autocomplete=\"off\" required pattern=\"0[23][0-9a-fA-F]{{64}}\"></label>\
                         <label>Its address<input name=\"host\" value=\"{}\" class=\"mono\" autocomplete=\"off\" required placeholder=\"host:9735\"></label>\
                         <p class=\"small\">Your payments to shops travel through this node. It never holds your money: the connection is yours, \
-                        and you can close it from your Lightning node's app at any time.</p></details>",
-                        if peer.is_empty() { " open" } else { "" }, if peer.is_empty() { "" } else { ": the suggested node, change it if you like" },
+                        and you can close it from your Lightning node's app at any time.{other}</p></details>",
+                        if peer.is_empty() { " open" } else { "" },
+                        if genesis { ": Lightning Stream Genesis, change it if you like" } else if peer.is_empty() { "" } else { ": the suggested node, change it if you like" },
                         esc(&peer), esc(&host)),
                     "Approve and open", Ext::Lines(format!("xbt-agentwallet-channel-open-v1\n(the node key)\n(its address)\n{txid}\n{exp}"))));
             } else if f["confirmations"].is_null() {
