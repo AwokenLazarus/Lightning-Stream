@@ -6284,3 +6284,90 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     let who = &rules[rules.find("id=\"sellers\"").unwrap()..];
     assert!(who.contains("Lightning node of Alpha films") && !who.contains("A coin address"), "{who}");
 }
+
+/// The simple view: the menu is Wallet, Shops, Limits, Activity (also as a bar at the bottom of a phone), every other page
+/// keeps its address, and Advanced puts today's menu back. The choice is the box's: another browser sees it too.
+///
+/// FAILS before: no `/advanced`, no `/activity`; the menu had no short form.
+#[test]
+fn the_simple_view_has_four_entries_and_advanced_puts_every_page_back() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.sell = true);
+    let mut br = logged_in(&bx);
+    let menu_of = |page: &str| page[page.find("id=\"site-nav\"").unwrap()..page.find("</header>").unwrap()].to_string();
+    // as installed: every page, and the switch offers the simple view
+    let before = menu_of(&br.get("/browse").body);
+    assert!(before.contains(">Buy<") && before.contains(">Sell<") && before.contains(">Simple view</button>"), "{before}");
+    assert!(!br.get("/browse").body.contains("class=\"bottom-bar\""));
+
+    let r = br.act("/browse", "/advanced", &[("on", "0")]);
+    assert_eq!((r.status, r.location()), (303, "./wallet"), "{}", r.body);
+    let wallet = br.get("/wallet").body;
+    let menu = menu_of(&wallet);
+    for (href, label) in [("./wallet", "Wallet"), ("./browse", "Shops"), ("./policy", "Limits"), ("./activity", "Activity")] {
+        assert!(menu.contains(&format!("<a href=\"{href}\"")) && menu.contains(&format!(">{label}")), "{label} in the menu: {menu}");
+    }
+    assert!(!menu.contains(">Sell<") && !menu.contains(">Settings<") && !menu.contains(">Buy<"), "{menu}");
+    assert!(menu.contains(">Advanced</button>"), "{menu}");
+    assert!(wallet.contains("<body class=\"simple\">") && wallet.contains("<nav class=\"bottom-bar\""), "the bar at the bottom");
+    assert!(wallet.contains("href=\"./activity\"") && !wallet.contains("<h2>Recent activity</h2>"), "the list of payments has its own page");
+    // Activity is a page, marked in the menu; the pages out of the menu still open
+    let activity = br.get("/activity");
+    assert_eq!(activity.status, 200);
+    assert!(activity.body.contains("<h1>Activity</h1>") && menu_of(&activity.body).contains("<a href=\"./activity\" aria-current=\"page\">Activity"), "{}", activity.body);
+    assert_eq!(br.get("/sell").status, 200);
+    assert_eq!(br.get("/setup").status, 200);
+    // the box's choice, not this browser's
+    let mut other = B::new(&bx.base);
+    assert_eq!(other.post("/login", &[("password", PW)]).status, 303);
+    assert!(other.get("/wallet").body.contains("<body class=\"simple\">"));
+    // without the CSRF token nothing changes
+    assert_ne!(br.post("/advanced", &[("on", "1")]).status, 303);
+    assert!(br.get("/wallet").body.contains("<body class=\"simple\">"));
+
+    let r = br.act("/wallet", "/advanced", &[("on", "1")]);
+    assert_eq!((r.status, r.location()), (303, "./"), "{}", r.body);
+    let wallet = br.get("/wallet").body;
+    assert!(menu_of(&wallet).contains(">Sell<") && wallet.contains("<h2>Recent activity</h2>") && !wallet.contains("bottom-bar"), "today's pages, unchanged");
+}
+
+/// A shop kept as a favorite is first on Browse and under the balance of the simple view's Wallet; removing it takes it away.
+///
+/// FAILS before: no `/favorite`.
+#[test]
+fn a_favorite_shop_is_on_the_wallet_page_and_first_on_browse() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Zebra files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
+         "items": [{{"title": "notes", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}},
+        {{"name": "Alpha films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "(c) Blender Foundation, CC BY 3.0"}}]}}
+    ]"#)).unwrap();
+    let bx = start(json!({}), false, |c| c.services_file = Some(path.clone()));
+    let mut br = logged_in(&bx);
+    assert!(!br.get("/browse").body.contains("<h2>Favorites</h2>"));
+    let service = "/service?seller=https%3A%2F%2Ffiles.example&name=Zebra%20files";
+    let page = br.get(service).body;
+    assert!(page.contains("Add this shop to your favorites"), "{page}");
+    let back = unescape(&field(&page[page.find("action=\"./favorite\"").unwrap()..], "back"));
+    let r = br.act(service, "/favorite", &[("seller", "https://files.example"), ("on", "1"), ("back", &back)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().starts_with("./service?seller="), "back to the service: {}", r.location());
+    assert!(br.get(service).body.contains("In your favorites: remove"));
+    let browse = br.get("/browse").body;
+    let favs = &browse[browse.find("<h2>Favorites</h2>").expect("favorites on Browse")..];
+    let favs = &favs[..favs.find("</div>").unwrap()];
+    assert!(favs.contains("Zebra files") && !favs.contains("Alpha films"), "{favs}");
+    // the simple view's Wallet has them under the balance
+    br.act("/browse", "/advanced", &[("on", "0")]);
+    let wallet = br.get("/wallet").body;
+    assert!(wallet.contains("<h2>Favorites</h2>") && wallet.contains("Zebra files"), "{wallet}");
+    // somewhere else to go back to is not followed; something that is no shop is refused
+    let r = br.act("/browse", "/favorite", &[("seller", "https://files.example"), ("on", "0"), ("back", "https://elsewhere.example/")]);
+    assert_eq!((r.status, r.location()), (303, "./browse"));
+    assert!(!br.get("/wallet").body.contains("<h2>Favorites</h2>"));
+    let r = br.act("/browse", "/favorite", &[("seller", "not a shop"), ("on", "1")]);
+    assert!(br.flash_after(&r).contains("not a shop"), "refused in words");
+}

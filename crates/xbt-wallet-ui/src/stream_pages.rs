@@ -40,8 +40,9 @@ impl App {
                 // a hashrate seller's live offer, where the Hashrate page's last look found it: nothing is asked for Browse
                 let offers = self.kept_hash_offers();
                 let live_offer = |seller: &str| crate::app::hashrate::live_offer_words(&offers, seller);
+                let favorites = if cat.is_empty() { self.favorites_html(&live) } else { String::new() };
                 let shown = browse_html(&live, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller), &live_offer);
-                format!("{warn}{shown}{}", offline_html(&gone, &days))
+                format!("{warn}{favorites}{shown}{}", offline_html(&gone, &days))
             }
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
@@ -49,6 +50,35 @@ impl App {
         let more = format!("<p class=\"small\">Your <a href=\"./services\">sellers</a>: add a shop, allow it to be paid, see the credit left with each.{}</p>",
                            if self.nostr.enabled() { " More sellers, not checked by anyone: <a href=\"./nostr\">found on Nostr</a>." } else { "" });
         self.html_page("Browse", "Browse", ctx, &format!("{body}{more}"), "")
+    }
+
+    /// The owner's favorite shops' services, as cards: on the Wallet page of the simple view and at the top of Browse.
+    /// Nothing where there are none.
+    pub(crate) fn favorites_html(&self, all: &[Service]) -> String {
+        let prefs = self.prefs();
+        let favs: Vec<&Service> = all.iter().filter(|s| services::http_origin(&s.seller).is_some_and(|o| prefs.is_favorite(&o))).collect();
+        if favs.is_empty() {
+            return String::new();
+        }
+        let mut b = String::from("<h2>Favorites</h2><div class=\"grid services favorites\">");
+        for s in favs {
+            b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}{}</span><h2>{}</h2><p class=\"price\">{}</p><p class=\"small\">{}</p></a>",
+                                service_href(s), s.category(), services::icon(s.category()), esc(s.category_words()), esc(&s.name),
+                                esc(if s.kind == Kind::Hashrate { services::HASHRATE_PRICE_WORDS } else { &s.price_text }), esc(&seller_words(all, &s.seller))));
+        }
+        b.push_str("</div>");
+        b
+    }
+
+    /// The button on a service's page that keeps its shop as a favorite, or stops.
+    fn favorite_form(&self, ctx: &Ctx, svc: &Service) -> String {
+        let Some(origin) = services::http_origin(&svc.seller) else { return String::new() };
+        let is = self.prefs().is_favorite(&origin);
+        format!("<form method=\"post\" action=\"./favorite\" class=\"favorite\">{}<input type=\"hidden\" name=\"seller\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"on\" value=\"{}\"><input type=\"hidden\" name=\"back\" value=\"{}\">\
+                 <button class=\"secondary\">{}</button></form>",
+                App::csrf_input(ctx), esc(&origin), if is { "0" } else { "1" }, service_href(svc),
+                if is { "★ In your favorites: remove" } else { "☆ Add this shop to your favorites" })
     }
 
     /// One-click forms for the suggested sellers not added yet.
@@ -114,6 +144,9 @@ impl App {
                     }
                 }
                 body.push_str(&service_html(&svc, own, &seller_words(&self.services().unwrap_or_default(), &svc.seller)));
+                if !own {
+                    body.push_str(&self.favorite_form(ctx, &svc));
+                }
                 if svc.has_files() {
                     // the node can't send a first ticket: said before a download is started
                     if !own {

@@ -34,6 +34,7 @@ pub mod setup;
 pub mod shops;
 pub mod stream_gateway;
 pub mod perf;
+pub mod prefs;
 
 pub const UI_JS: &str = include_str!("../assets/ui.js");
 pub const UI_CSS: &str = include_str!("../assets/ui.css");

@@ -112,6 +112,9 @@ pub struct Nav<'a> {
     pub logged_in: bool,
     pub sections: &'a [&'static Section],
     pub brand: &'a str,
+    /// The switch between the simple view and every page: `None` where there is none (the gateway,
+    /// a page before the login), else whether every page is shown now.
+    pub advanced: Option<bool>,
 }
 
 /// One page in a section: its address, the title it is shown under (and found by), the tab's words.
@@ -203,6 +206,18 @@ pub const SELL_HASH: Section = Section {
     also: &[],
     advanced: &[],
 };
+/// The simple view: four entries, one page each, for an owner who buys. Selling, setup and the other
+/// pages stay where they are, behind the Advanced switch.
+pub const SIMPLE_WALLET: Section = Section { label: "Wallet", tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Wallet" }], also: &["Approvals"], advanced: &[] };
+pub const SIMPLE_SHOPS: Section = Section {
+    label: "Shops",
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Shops" }],
+    also: &["Service", "AI", "Hashrate", "VPN", "Sellers", "Live connections"],
+    advanced: &[],
+};
+pub const SIMPLE_LIMITS: Section = Section { label: "Limits", tabs: &[Tab { href: "./policy", title: "Spending rules", label: "Limits" }], also: &[], advanced: &[] };
+pub const SIMPLE_ACTIVITY: Section = Section { label: "Activity", tabs: &[Tab { href: "./activity", title: "Activity", label: "Activity" }], also: &[], advanced: &[] };
+pub const SIMPLE_SECTIONS: [&Section; 4] = [&SIMPLE_WALLET, &SIMPLE_SHOPS, &SIMPLE_LIMITS, &SIMPLE_ACTIVITY];
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
 pub const STREAM_SECTIONS: [&Section; 5] = [&SERVICES, &SELL, &WALLET, &APPS, &SETTINGS];
 pub const STREAM_SECTIONS_HASH: [&Section; 5] = [&SERVICES_HASH, &SELL_HASH, &WALLET, &APPS, &SETTINGS_HASH];
@@ -224,6 +239,9 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
     let mut links = String::new();
     let mut tabs = String::new();
     let mut banner = String::new();
+    // the simple view's four entries again, as a bar at the bottom of a phone's screen
+    let mut bar = String::new();
+    let simple = nav.logged_in && nav.advanced == Some(false);
     if nav.logged_in {
         for sec in nav.sections {
             let here = sec.has(nav.active);
@@ -235,6 +253,9 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
                 String::new()
             };
             links.push_str(&format!("<a href=\"{}\"{cur}>{}{badge}</a>", sec.tabs[0].href, esc(sec.label)));
+            if simple {
+                bar.push_str(&format!("<a href=\"{}\"{cur}>{}</a>", sec.tabs[0].href, esc(sec.label)));
+            }
             if here && sec.tabs.len() + sec.advanced.len() > 1 {
                 tabs.push_str(&format!("<nav class=\"tabs\" aria-label=\"{}\">", esc(sec.label)));
                 for t in sec.tabs {
@@ -257,6 +278,12 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
                 }
             }
         }
+        if let Some(on) = nav.advanced {
+            let (to, words, title) = if on { ("0", "Simple view", "Show only Wallet, Shops, Limits and Activity") }
+                                     else { ("1", "Advanced", "Show every page: selling, setup, keys and the rest") };
+            links.push_str(&format!("<form method=\"post\" action=\"./advanced\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                                     <input type=\"hidden\" name=\"on\" value=\"{to}\"><button class=\"link view-switch\" title=\"{title}\">{words}</button></form>", esc(nav.csrf)));
+        }
         links.push_str(&format!("<form method=\"post\" action=\"./logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <button class=\"link\">Log out</button></form>", esc(nav.csrf)));
         if nav.pending > 0 && nav.active != "Approvals" {
@@ -278,13 +305,15 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" type=\"image/svg+xml\" href=\"./mark.svg?v={}\"><title>{} · {}</title>\
-             <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body>\
+             <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body{}>\
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
              <header>{brand}{menu}{THEME_TOGGLE}</header>\
-             <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
+             <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>{}\
              <footer>Your money stays on your own Lightning node. Nobody else holds it. <span class=\"version\">Lightning Stream {}</span></footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
-            asset_version(crate::MARK_SVG), esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS), esc(title),
+            asset_version(crate::MARK_SVG), esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS),
+            if simple { " class=\"simple\"" } else { "" }, esc(title),
+            if simple { format!("<nav class=\"bottom-bar\" aria-label=\"Main, at the bottom\">{bar}</nav>") } else { String::new() },
             esc(crate::release_version()), asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 

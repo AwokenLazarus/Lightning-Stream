@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::Auth;
 use crate::config::{Config, Role};
-use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
+use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, SIMPLE_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
                   STREAM_SECTIONS_HASH, WALLET_BRAND, WALLET_SECTIONS, WALLET_SECTIONS_HASH};
 use crate::link::SignerLink;
 use crate::server::{strip_base, Req, Resp};
@@ -564,6 +564,7 @@ impl App {
             "/api/visit" => self.api_visit(&req.query),
             "/api/hashrate-rentals" => self.api_hashrate_rentals(&ctx),
             "/connections" => self.connections(&ctx),
+            "/activity" => self.activity_page(&ctx, &req.query),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => match req.query.get("fix").map(String::as_str) {
@@ -605,7 +606,56 @@ impl App {
             Role::Gateway => (&GATEWAY_SECTIONS, GATEWAY_BRAND),
         };
         let pending = if logged_in && self.cfg.role == Role::Wallet { self.pending_count() } else { 0 };
-        Nav { active, csrf, pending, logged_in, sections, brand }
+        // the owner's choice of view: the simple one has four entries, whatever the box can also do
+        let advanced = (logged_in && self.cfg.role == Role::Wallet).then(|| self.prefs().advanced);
+        let sections = if advanced == Some(false) { &SIMPLE_SECTIONS } else { sections };
+        Nav { active, csrf, pending, logged_in, sections, brand, advanced }
+    }
+
+    /// The owner's choices for this box's pages ([`crate::prefs`]).
+    pub(crate) fn prefs(&self) -> crate::prefs::Prefs {
+        crate::prefs::load(&self.cfg.data_dir.join(crate::prefs::FILE))
+    }
+
+    fn save_prefs(&self, p: &crate::prefs::Prefs) -> Result<(), String> {
+        crate::prefs::save(&self.cfg.data_dir.join(crate::prefs::FILE), p)
+    }
+
+    /// The simple view is on: four entries in the menu, the pages said for someone who buys.
+    pub(crate) fn simple(&self) -> bool {
+        self.cfg.role == Role::Wallet && !self.prefs().advanced
+    }
+
+    /// `POST /advanced`: the simple view (`on=0`) or every page (`on=1`). Nothing but the menu changes: every page keeps its address.
+    fn advanced_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let mut p = self.prefs();
+        p.advanced = f.get("on").is_some_and(|v| v == "1");
+        match self.save_prefs(&p) {
+            Ok(()) => self.flash(ctx, true, if p.advanced { "Every page is in the menu now. Simple view puts the short menu back." }
+                                            else { "Simple view is on. The other pages are behind Advanced." }),
+            Err(e) => self.flash(ctx, false, e),
+        }
+        Resp::redirect(if p.advanced { "./" } else { "./wallet" })
+    }
+
+    /// `POST /favorite`: keep a shop as a favorite, or stop. Back to the page it was pressed on.
+    fn favorite_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let back = f.get("back").map(String::as_str).filter(|b| b.starts_with("./service?") && !b.contains(['\r', '\n'])).unwrap_or("./browse").to_string();
+        let Some(origin) = f.get("seller").and_then(|s| crate::services::http_origin(s)) else {
+            self.flash(ctx, false, "That is not a shop's address.");
+            return Resp::redirect(&back);
+        };
+        let on = f.get("on").is_some_and(|v| v == "1");
+        let mut p = self.prefs();
+        if !p.set_favorite(&origin, on) {
+            self.flash(ctx, false, format!("You have {} favorites, the most the app keeps. Remove one first.", crate::prefs::MAX_FAVORITES));
+            return Resp::redirect(&back);
+        }
+        match self.save_prefs(&p) {
+            Ok(()) => self.flash(ctx, true, if on { "Added to your favorites." } else { "Removed from your favorites." }),
+            Err(e) => self.flash(ctx, false, e),
+        }
+        Resp::redirect(&back)
     }
 
     pub(crate) fn render(&self, title: &str, ctx: &Ctx, body: &str) -> String {
@@ -729,6 +779,8 @@ impl App {
         };
         match req.path.as_str() {
             "/app" => self.app_open(ctx, f),
+            "/advanced" => self.advanced_post(ctx, f),
+            "/favorite" => self.favorite_post(ctx, f),
             "/app-stop" => self.app_stop(ctx, f),
             "/app-limit" => self.app_limit(f),
             "/identity" => self.identity(ctx, f),
@@ -987,6 +1039,29 @@ impl App {
             b.push_str(&t);
         }
         b.push_str("</section>");
+        // the simple view: favorite shops under the balance, what was paid on its own page
+        if self.simple() {
+            b.push_str(&self.favorites_html(&self.services().unwrap_or_default()));
+            b.push_str("<p class=\"status-line\"><a class=\"button-link primary\" href=\"./browse\">Browse shops</a> · <a href=\"./activity\">What you paid: Activity</a></p>");
+            return self.page("Wallet", ctx, b);
+        }
+        b.push_str(&self.activity_html(query, "./wallet"));
+        b.push_str("<details class=\"card\"><summary>Technical details</summary>");
+        b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),
+                         ("Node wallet", escv(health.get("wallet"))), ("Test mining", escv(health.get("mining")))]));
+        b.push_str("</details>");
+        self.page("Wallet", ctx, b)
+    }
+
+    /// `GET /activity`: what was paid, reserved and refused, newest first. The Wallet page's list, on a page of its own.
+    fn activity_page(&self, ctx: &Ctx, query: &HashMap<String, String>) -> Resp {
+        let b = format!("<p class=\"lead\">Every payment the app made or refused, newest first.</p>{}", self.activity_html(query, "./activity"));
+        self.page("Activity", ctx, b)
+    }
+
+    /// The latest payments as a table, for the page at `here` (its "Show more" comes back to it).
+    fn activity_html(&self, query: &HashMap<String, String>, here: &str) -> String {
+        let mut b = String::new();
         // the latest 15 events, or with "Show more" (`?more=1`) the latest 200
         let more = query.get("more").is_some_and(|m| m == "1");
         let recent = self.call("history", json!({"limit": if more { RECENT_MORE } else { RECENT_ROWS }}));
@@ -1014,7 +1089,10 @@ impl App {
                                 esc(&who(&txt(e.get("origin")))), sats_of_msat(msat("charged_msat")), msat("max_msat") / 1000));
         }
         if let Ok(h) = recent {
-            b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
+            if here == "./wallet" {
+                b.push_str("<h2>Recent activity</h2>");
+            }
+            b.push_str("<div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
             // the bookkeeping of a reservation (its booking made what was paid) is not a row of its own
             let all: Vec<Value> = h["events"].as_array().cloned().unwrap_or_default();
             // and one row a payment: its allowed and reserved steps fold into its outcome
@@ -1078,14 +1156,10 @@ impl App {
             b.push_str("</tbody></table></div>");
             // there may be more than the page shows
             if !more && h["events"].as_array().is_some_and(|a| a.len() >= RECENT_ROWS) {
-                b.push_str(&format!("<p class=\"small\"><a href=\"./wallet?more=1\">Show more</a> (the latest {RECENT_MORE})</p>"));
+                b.push_str(&format!("<p class=\"small\"><a href=\"{here}?more=1\">Show more</a> (the latest {RECENT_MORE})</p>"));
             }
         }
-        b.push_str("<details class=\"card\"><summary>Technical details</summary>");
-        b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),
-                         ("Node wallet", escv(health.get("wallet"))), ("Test mining", escv(health.get("mining")))]));
-        b.push_str("</details>");
-        self.page("Wallet", ctx, b)
+        b
     }
 
     // --- approvals ----------------------------------------------------------------------------------
