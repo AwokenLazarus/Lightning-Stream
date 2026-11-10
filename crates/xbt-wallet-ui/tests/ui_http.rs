@@ -6541,3 +6541,9 @@ fn with_the_open_key_add_money_moves_the_deposit_and_opens_the_connection() {
     let done = br.get("/add-money").body;
     assert!(done.contains("your connection is opening") && !done.contains("data-sign=\"channel\""), "{done}");
 }
+
+/// The open key the box bakes is the open key the signer takes.
+#[test]
+fn the_open_key_baked_is_the_one_the_signer_takes() {
+    assert_eq!(xbt_wallet_ui::setup::OPEN_OPS, xbt_signer::ln_open::OPEN_OPS);
+}

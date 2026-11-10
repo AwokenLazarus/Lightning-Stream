@@ -22,7 +22,8 @@ pub const RAIL_MACAROON: &str = "rail.macaroon";
 /// The key the funding step opens the first channel with (`xbt_signer::ln_open`), beside the rail's: made only
 /// with a box's first rail key (a new install), never added to a box that pays already.
 pub const OPEN_MACAROON: &str = "open.macaroon";
-pub const OPEN_OPS: [&str; 6] = xbt_signer::ln_open::OPEN_OPS;
+/// What it holds: the signer's `ln_open::OPEN_OPS`, written out (this crate does not link the signer; a test holds them equal).
+pub const OPEN_OPS: [&str; 6] = ["address:write", "offchain:read", "offchain:write", "onchain:read", "onchain:write", "peers:write"];
 pub const MAINNET_ACK_FILE: &str = "mainnet-ack";
 
 /// What every page says while the owner has yet to confirm paying with real money (mainnet).
