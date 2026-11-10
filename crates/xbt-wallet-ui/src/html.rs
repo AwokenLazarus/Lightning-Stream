@@ -215,7 +215,7 @@ pub const SIMPLE_SHOPS: Section = Section {
     also: &["Service", "AI", "Hashrate", "VPN", "Sellers", "Live connections"],
     advanced: &[],
 };
-pub const SIMPLE_LIMITS: Section = Section { label: "Limits", tabs: &[Tab { href: "./policy", title: "Spending rules", label: "Limits" }], also: &[], advanced: &[] };
+pub const SIMPLE_LIMITS: Section = Section { label: "Limits", tabs: &[Tab { href: "./limits", title: "Limits", label: "Limits" }], also: &["Spending rules"], advanced: &[] };
 pub const SIMPLE_ACTIVITY: Section = Section { label: "Activity", tabs: &[Tab { href: "./activity", title: "Activity", label: "Activity" }], also: &[], advanced: &[] };
 pub const SIMPLE_SECTIONS: [&Section; 4] = [&SIMPLE_WALLET, &SIMPLE_SHOPS, &SIMPLE_LIMITS, &SIMPLE_ACTIVITY];
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.

@@ -164,6 +164,26 @@ const MAINNET_CAPPED_KEYS: [&str; 8] = ["max_per_tx_sats", "daily_budget_sats", 
                                          "human_threshold_sats", "hot_balance_cap_sats", "velocity_max"];
 
 /// Whether paying over Lightning is turned on in `p`.
+/// The amounts a limit's slider stops at, in sats.
+const LIMIT_STEPS: [i64; 10] = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
+
+/// The limits of the Limits page: the rule each changes, its name there, and what it means.
+const LIMITS: [(&str, &str, &str); 3] = [
+    ("daily_budget_sats", "In a day", "The most the app may spend in any 24 hours, on everything together."),
+    ("weekly_budget_sats", "In a week", "The most the app may spend in any 7 days."),
+    ("per_counterparty_daily_sats", "One shop, in a day", "The most any one shop may be paid in any 24 hours."),
+];
+
+/// A slider's stops: [`LIMIT_STEPS`], and the limit as it is now where that is none of them.
+fn limit_steps(now: i64) -> Vec<i64> {
+    let mut v = LIMIT_STEPS.to_vec();
+    if now > 0 && !v.contains(&now) {
+        v.push(now);
+        v.sort_unstable();
+    }
+    v
+}
+
 fn paying_on(p: &Value) -> bool {
     p.get("ln").and_then(|l| l.get("enabled")) == Some(&Value::Bool(true))
 }
@@ -565,6 +585,7 @@ impl App {
             "/api/hashrate-rentals" => self.api_hashrate_rentals(&ctx),
             "/connections" => self.connections(&ctx),
             "/activity" => self.activity_page(&ctx, &req.query),
+            "/limits" => self.limits_page(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => match req.query.get("fix").map(String::as_str) {
@@ -636,6 +657,67 @@ impl App {
             Err(e) => self.flash(ctx, false, e),
         }
         Resp::redirect(if p.advanced { "./" } else { "./wallet" })
+    }
+
+    /// `GET /limits`: the three limits most owners ever change, as sliders. Each slider moves over [`LIMIT_STEPS`] and
+    /// the limit as it is now, so opening the page and pressing the button changes nothing.
+    fn limits_page(&self, ctx: &Ctx) -> Resp {
+        let cur = match self.call("policy_get", json!({})) {
+            Ok(v) => v,
+            Err(e) => return self.page("Limits", ctx, Self::error_box(&e)),
+        };
+        if !paying_on(&cur["policy"]) {
+            return self.page("Limits", ctx, "<section class=\"card\"><p>Paying is not turned on yet, so there are no limits to change. \
+                The safe starter rules turn it on, with low limits.</p><p><a class=\"button-link primary\" href=\"./policy\">Turn paying on</a></p></section>".into());
+        }
+        let mut b = String::from("<p class=\"lead\">How much the app may spend without asking you. It never spends past these, whatever a shop or an \
+            agent asks for. A change takes effect once you approve it.</p><form method=\"post\" action=\"./limits\" class=\"card limits\">");
+        b.push_str(&Self::csrf_input(ctx));
+        for (key, title, words) in LIMITS {
+            let now = int(cur["policy"].get(key).or(cur["effective"].get(key)));
+            let steps = limit_steps(now);
+            let at = steps.iter().position(|s| *s == now).unwrap_or(0);
+            b.push_str(&format!("<label class=\"limit\"><span class=\"limit-title\">{title}</span>\
+                <input type=\"range\" name=\"{key}\" min=\"0\" max=\"{}\" step=\"1\" value=\"{at}\" data-steps=\"{}\">\
+                <output>{} sats</output></label><input type=\"hidden\" name=\"cur_{key}\" value=\"{now}\">\
+                <p class=\"small\">{words} Now: {} sats. The slider goes from {} to {} sats.</p>",
+                steps.len() - 1, steps.iter().map(i64::to_string).collect::<Vec<_>>().join(","), crate::html::group3(now.max(0) as u64),
+                crate::html::group3(now.max(0) as u64), crate::html::group3(steps[0] as u64), crate::html::group3(steps[steps.len() - 1] as u64)));
+        }
+        b.push_str("<button>Review the change</button></form>\
+            <p class=\"small\">A week's limit is never under a day's, and one shop's never over the day's: the app evens them out when you review. \
+            Every other rule (who may be paid, when the app asks you first) is in <a href=\"./policy\">all spending rules</a>.</p>");
+        self.page("Limits", ctx, b)
+    }
+
+    /// `POST /limits`: the signed rules with the sliders' limits, shown as a change to review and approve: the same
+    /// review, signature and signer checks as a change made on the Spending rules page.
+    fn limits_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let cur = match self.call("policy_get", json!({})) {
+            Ok(v) => v,
+            Err(e) => return self.page("Limits", ctx, Self::error_box(&e)),
+        };
+        let mut p = cur["policy"].clone();
+        if !p.is_object() || !paying_on(&p) {
+            return Resp::redirect("./limits");
+        }
+        for (key, _, _) in LIMITS {
+            // the slider's steps were built from the limit the page showed: the same list here, whatever changed since
+            let shown = f.get(&format!("cur_{key}")).and_then(|v| v.trim().parse::<i64>().ok()).filter(|v| *v > 0)
+                .unwrap_or_else(|| int(cur["policy"].get(key).or(cur["effective"].get(key))));
+            let steps = limit_steps(shown);
+            let Some(at) = f.get(key).and_then(|v| v.trim().parse::<usize>().ok()).filter(|i| *i < steps.len()) else { continue };
+            p[key] = Value::from(steps[at]);
+        }
+        let n = |p: &Value, k: &str| p.get(k).and_then(Value::as_i64);
+        if let (Some(day), Some(week)) = (n(&p, "daily_budget_sats"), n(&p, "weekly_budget_sats")) {
+            p["weekly_budget_sats"] = Value::from(week.max(day));
+        }
+        if let (Some(day), Some(shop)) = (n(&p, "daily_budget_sats"), n(&p, "per_counterparty_daily_sats")) {
+            p["per_counterparty_daily_sats"] = Value::from(shop.min(day));
+        }
+        let as_json = HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string())]);
+        self.policy_preview(ctx, &as_json)
     }
 
     /// `POST /favorite`: keep a shop as a favorite, or stop. Back to the page it was pressed on.
@@ -781,6 +863,7 @@ impl App {
             "/app" => self.app_open(ctx, f),
             "/advanced" => self.advanced_post(ctx, f),
             "/favorite" => self.favorite_post(ctx, f),
+            "/limits" => self.limits_post(ctx, f),
             "/app-stop" => self.app_stop(ctx, f),
             "/app-limit" => self.app_limit(f),
             "/identity" => self.identity(ctx, f),

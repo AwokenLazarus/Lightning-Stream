@@ -6304,7 +6304,7 @@ fn the_simple_view_has_four_entries_and_advanced_puts_every_page_back() {
     assert_eq!((r.status, r.location()), (303, "./wallet"), "{}", r.body);
     let wallet = br.get("/wallet").body;
     let menu = menu_of(&wallet);
-    for (href, label) in [("./wallet", "Wallet"), ("./browse", "Shops"), ("./policy", "Limits"), ("./activity", "Activity")] {
+    for (href, label) in [("./wallet", "Wallet"), ("./browse", "Shops"), ("./limits", "Limits"), ("./activity", "Activity")] {
         assert!(menu.contains(&format!("<a href=\"{href}\"")) && menu.contains(&format!(">{label}")), "{label} in the menu: {menu}");
     }
     assert!(!menu.contains(">Sell<") && !menu.contains(">Settings<") && !menu.contains(">Buy<"), "{menu}");
@@ -6370,4 +6370,37 @@ fn a_favorite_shop_is_on_the_wallet_page_and_first_on_browse() {
     assert!(!br.get("/wallet").body.contains("<h2>Favorites</h2>"));
     let r = br.act("/browse", "/favorite", &[("seller", "not a shop"), ("on", "1")]);
     assert!(br.flash_after(&r).contains("not a shop"), "refused in words");
+}
+
+/// Limits: three sliders over plain amounts. Moving one leads to the same review a change on the Spending rules page gets,
+/// naming only that limit; pressing the button with nothing moved changes nothing; a week is never left under a day.
+///
+/// FAILS before: no `/limits`.
+#[test]
+fn the_limits_page_changes_a_limit_with_a_slider_through_the_usual_review() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({"ln": {"enabled": true}, "daily_budget_sats": 7000, "weekly_budget_sats": 20000, "per_counterparty_daily_sats": 5000}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/limits").body;
+    assert!(page.contains("<h1>Limits</h1>") && page.matches("type=\"range\"").count() == 3, "{page}");
+    // 7,000 is no stop of the slider: it is one here, where the slider stands
+    assert!(page.contains("name=\"daily_budget_sats\" min=\"0\" max=\"10\" step=\"1\" value=\"3\" data-steps=\"1000,2000,5000,7000,10000,"), "{page}");
+    assert!(page.contains("Now: 7,000 sats"), "{page}");
+    let same = [("daily_budget_sats", "3"), ("cur_daily_budget_sats", "7000"), ("weekly_budget_sats", "4"), ("cur_weekly_budget_sats", "20000"),
+                ("per_counterparty_daily_sats", "2"), ("cur_per_counterparty_daily_sats", "5000")];
+    let r = br.act("/limits", "/limits", &same);
+    assert!(r.status == 200 && r.body.contains("No change."), "nothing moved, nothing to sign: {}", r.body);
+    // the day's limit to 50,000 (stop 6): the week's follows it up, and the review says both
+    let mut moved = same;
+    moved[0].1 = "6";
+    let r = br.act("/limits", "/limits", &moved);
+    let body = unescape(&r.body);
+    assert!(r.status == 200 && body.contains("Check the change") && !body.contains("No change."), "{body}");
+    assert!(body.contains("50,000") || body.contains("50000"), "the new limit is in the review: {body}");
+    // nothing is changed until it is signed
+    assert!(br.get("/limits").body.contains("Now: 7,000 sats"));
+    // a stop past the end of the slider is not a limit
+    let mut wild = same;
+    wild[0].1 = "99";
+    assert!(br.act("/limits", "/limits", &wild).body.contains("No change."));
 }

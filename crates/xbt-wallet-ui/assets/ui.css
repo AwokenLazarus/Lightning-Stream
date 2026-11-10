@@ -107,6 +107,10 @@ header nav form.inline button.link:hover { color: var(--fg); }
 .theme-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 .theme-toggle .moon, :root[data-theme="light"] .theme-toggle .sun { display: none; }
 :root[data-theme="light"] .theme-toggle .moon { display: block; }
+label.limit { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; align-items: center; margin-top: 18px; }
+label.limit .limit-title { font-weight: 600; }
+label.limit input[type="range"] { grid-column: 1 / -1; width: 100%; min-height: 38px; padding: 0; accent-color: var(--fg); }
+label.limit output { grid-row: 1; grid-column: 2; font-variant-numeric: tabular-nums; }
 .bottom-bar { display: none; }
 @media (max-width: 760px) {
   .bottom-bar { display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; gap: 4px; padding: 6px 8px calc(6px + env(safe-area-inset-bottom));

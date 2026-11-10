@@ -593,6 +593,12 @@
   if (doc && doc.documentElement) {
     doc.documentElement.classList.add("js");
     var toggle = $(".menu-toggle"), header = $("header");
+    // a limit's slider: its stops are amounts, said beside it as it moves
+    Array.prototype.forEach.call(doc.querySelectorAll("input[type=range][data-steps]"), function (r) {
+      var steps = r.getAttribute("data-steps").split(","), out = r.parentNode.querySelector("output");
+      var show = function () { if (out && steps[r.value]) { out.textContent = Number(steps[r.value]).toLocaleString("en-US") + " sats"; } };
+      r.addEventListener("input", show); show();
+    });
     // the bar casts a shadow once the page has scrolled under it
     if (header) {
       var edge = function () { header.classList.toggle("scrolled", (root.scrollY || 0) > 4); };
