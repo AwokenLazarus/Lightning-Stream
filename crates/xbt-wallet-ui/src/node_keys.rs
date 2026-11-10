@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use xbt_gateway::node::{bake_macaroon, checked_macaroon, INFO_OPS, INVOICE_OPS};
 
-use crate::setup::{write_shared, GW_INFO, GW_INVOICES, GW_SIGN, RAIL_MACAROON, RAIL_OPS};
+use crate::setup::{write_shared, GW_INFO, GW_INVOICES, GW_SIGN, OPEN_MACAROON, OPEN_OPS, RAIL_MACAROON, RAIL_OPS};
 
 /// What the gateway's sign key holds: lnd's SignMessage and no other call (a URI permission), so it
 /// can sign the statement that vouches for its link key and nothing that moves coins.
@@ -378,6 +378,30 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
         if is_off(dir) {
             continue;
         }
+        // a box's first rail key (a new install): the open key with it, and before it, so the signer that starts on the
+        // rail key finds both. A box that pays already is given no wider key by itself; a node that will not bake it
+        // leaves the owner to open the channel in the node's own app
+        let first_rail = s.rail_dir.as_ref() == Some(dir) && !dir.join(RAIL_MACAROON).is_file() && !dir.join(OPEN_MACAROON).is_file()
+            && !s.bake_to.as_ref().is_some_and(|h| h.join(RAIL_MACAROON).is_file() || h.join(OPEN_MACAROON).is_file());
+        if first_rail {
+            let id = root_key_id();
+            match bake(&OPEN_OPS, id) {
+                Ok(mac) => {
+                    match &s.bake_to {
+                        Some(h) => {
+                            record(h, OPEN_MACAROON, id, &OPEN_OPS)?;
+                            write_shared(h, OPEN_MACAROON, &mac)?;
+                        }
+                        None => {
+                            write_shared(dir, OPEN_MACAROON, &mac)?;
+                            record(dir, OPEN_MACAROON, id, &OPEN_OPS)?;
+                        }
+                    }
+                    out.made.push(OPEN_MACAROON.to_string());
+                }
+                Err(e) => out.skipped.push((OPEN_MACAROON.to_string(), e)),
+            }
+        }
         for (file, ops) in files {
             // baked before and not taken yet: the hand-over holds it
             if dir.join(file).is_file() || s.bake_to.as_ref().is_some_and(|h| h.join(file).is_file()) {
@@ -418,8 +442,8 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
 }
 
 /// The keys each dir takes from the hand-over folder, by name, each with the permissions it must hold.
-const HANDED: [(bool, &str, &[&str]); 4] =
-    [(true, RAIL_MACAROON, &RAIL_OPS), (false, GW_INVOICES, &INVOICE_OPS), (false, GW_INFO, &INFO_OPS), (false, GW_SIGN, &SIGN_OPS)];
+const HANDED: [(bool, &str, &[&str]); 5] =
+    [(true, OPEN_MACAROON, &OPEN_OPS), (true, RAIL_MACAROON, &RAIL_OPS), (false, GW_INVOICES, &INVOICE_OPS), (false, GW_INFO, &INFO_OPS), (false, GW_SIGN, &SIGN_OPS)];
 
 /// Move the keys baked into the hand-over folder ([`Settings::take_from`]) into their dirs, each with
 /// its record (root key id, permissions), and remove them there. A dir that already has the key (the

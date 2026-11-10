@@ -91,6 +91,7 @@ services:
       XBT_CHAIN: ${LS_CHAIN:-main}
       B2_LN_REST: ${LS_LND_REST:?set LS_LND_REST in .env, the Lightning node's REST address like https://127.0.0.1:8080}
       B2_LN_MACAROON: /data/run/ln/rail.macaroon
+      B2_LN_OPEN_MACAROON: /data/run/ln/open.macaroon
       B2_MAINNET_ACK_FILE: /data/run/ln/mainnet-ack
       B2_LN_TLS_CERT: /data/lightning/tls.cert
       B2_STREAM_DIR: /data/run/signer/streams

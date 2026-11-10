@@ -19,6 +19,10 @@ use crate::server::{Req, Resp};
 /// What the wallet's rail macaroon must grant, and nothing more (the signer refuses more on mainnet).
 pub const RAIL_OPS: [&str; 4] = ["info:read", "offchain:read", "offchain:write", "onchain:read"];
 pub const RAIL_MACAROON: &str = "rail.macaroon";
+/// The key the funding step opens the first channel with (`xbt_signer::ln_open`), beside the rail's: made only
+/// with a box's first rail key (a new install), never added to a box that pays already.
+pub const OPEN_MACAROON: &str = "open.macaroon";
+pub const OPEN_OPS: [&str; 6] = xbt_signer::ln_open::OPEN_OPS;
 pub const MAINNET_ACK_FILE: &str = "mainnet-ack";
 
 /// What every page says while the owner has yet to confirm paying with real money (mainnet).
