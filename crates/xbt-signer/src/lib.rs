@@ -38,6 +38,7 @@ pub mod keystore;
 pub mod legacy;
 pub mod ln;
 pub mod ln_funding;
+pub mod ln_open;
 pub mod ln_offer;
 pub mod lottery;
 pub mod macaroon;

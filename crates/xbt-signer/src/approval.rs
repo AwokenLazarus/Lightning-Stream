@@ -41,6 +41,14 @@ pub fn deposit_forward_message(deposit_address: &str, dest: &str, expiry: i64) -
     join(&[DEPOSIT_DOMAIN, deposit_address.as_bytes(), dest.as_bytes(), expiry.to_string().as_bytes()])
 }
 
+/// The first channel: a human opens one channel to the node `peer` (reached at `host`), funded with the
+/// forwarded deposit `forward_txid` and nothing else.
+pub const CHANNEL_DOMAIN: &[u8] = b"xbt-agentwallet-channel-open-v1";
+
+pub fn channel_open_message(peer: &str, host: &str, forward_txid: &str, expiry: i64) -> Vec<u8> {
+    join(&[CHANNEL_DOMAIN, peer.as_bytes(), host.as_bytes(), forward_txid.as_bytes(), expiry.to_string().as_bytes()])
+}
+
 /// AGP-039: replace the policy whose file hashes to `prev_sha256` by exactly `policy_text` (the bytes
 /// the signer writes), valid until `expiry`. Binding the previous hash stops a replay of an older change.
 pub fn policy_message(prev_sha256: &str, expiry: i64, policy_text: &str) -> Vec<u8> {

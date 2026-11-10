@@ -49,8 +49,8 @@ const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 
 /// Every domain a human-approved message starts with: only these are signed with the box key.
-pub const APPROVABLE: [&[u8]; 10] = [DOMAIN, RECOVER_DOMAIN, SWEEP_DOMAIN, POLICY_DOMAIN, HUMAN_KEY_DOMAIN, ROTATE_DOMAIN, BACKUP_DOMAIN,
-                                     DENY_DOMAIN, UNBLOCK_DOMAIN, crate::approval::DEPOSIT_DOMAIN];
+pub const APPROVABLE: [&[u8]; 11] = [DOMAIN, RECOVER_DOMAIN, SWEEP_DOMAIN, POLICY_DOMAIN, HUMAN_KEY_DOMAIN, ROTATE_DOMAIN, BACKUP_DOMAIN,
+                                     DENY_DOMAIN, UNBLOCK_DOMAIN, crate::approval::DEPOSIT_DOMAIN, crate::approval::CHANNEL_DOMAIN];
 
 /// `msg` is one of the human-approved messages: an approval domain, then a newline.
 pub fn approvable(msg: &[u8]) -> bool {

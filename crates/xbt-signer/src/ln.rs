@@ -551,11 +551,11 @@ impl LndRest {
         }
     }
 
-    fn get(&self, path: &str) -> Result<Value> {
+    pub(crate) fn get(&self, path: &str) -> Result<Value> {
         Self::answer(Self::sent(self.req("GET", path).call())?)
     }
 
-    fn post(&self, path: &str, body: &Value, timeout_s: i64) -> Result<Value> {
+    pub(crate) fn post(&self, path: &str, body: &Value, timeout_s: i64) -> Result<Value> {
         Self::answer(Self::sent(self.req("POST", path).timeout(Duration::from_secs(timeout_s.max(1) as u64 + 30))
             .set("Content-Type", "application/json").send_string(&body.to_string()))?)
     }

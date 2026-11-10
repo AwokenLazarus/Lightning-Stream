@@ -200,6 +200,8 @@ pub struct SignerOptions {
     pub keystore: Option<Arc<KeyStore>>,
     /// AGP-048: the LN node `rail=ln` pays through (default: `B2_LN_REST` / `B2_LN_MACAROON` / `B2_LN_TLS_CERT`).
     pub ln: Option<Arc<dyn LnBackend>>,
+    /// The node with the open key, for the funding step (default: `B2_LN_REST` / `B2_LN_OPEN_MACAROON`).
+    pub ln_open: Option<Arc<dyn crate::ln_open::OpenBackend>>,
     /// How the ticket payer talks HTTP to sellers (default: [`crate::ticket_pay::UreqWire`]).
     pub ticket_wire: Option<Arc<dyn crate::ticket_pay::TicketWire>>,
 }
@@ -234,6 +236,10 @@ pub struct Signer {
     /// rail shut, and the write-ahead payment book.
     pub ln: Option<Arc<dyn LnBackend>>,
     pub ln_error: Option<String>,
+    /// The node with the open key ([`crate::ln_open`]): none where the owner opens channels themselves.
+    pub ln_open: Option<Arc<dyn crate::ln_open::OpenBackend>>,
+    pub ln_open_error: Option<String>,
+    pub funding: crate::ln_open::FundingLog,
     pub ln_book: LnBook,
     /// AGP-049: channel funding verdicts from our own node, per funding outpoint (final ones only).
     /// Funding verdicts by funding, with the hash of the block each was reached on (AGP-066), kept on
@@ -379,13 +385,22 @@ impl Signer {
                 Err(e) => (None, Some(e.msg)),
             },
         };
+        // a wrong open key shuts only the funding step: the owner then opens the channel in the node's own app
+        let (ln_open, ln_open_error) = match opts.ln_open.clone() {
+            Some(b) => (Some(b), None),
+            None => match crate::ln_open::LndOpen::from_env(chain == "main") {
+                Ok(b) => (b.map(|b| Arc::new(b) as Arc<dyn crate::ln_open::OpenBackend>), None),
+                Err(e) => (None, Some(e.msg)),
+            },
+        };
+        let funding = crate::ln_open::FundingLog::open(&run.join(crate::ln_open::LOG_FILE));
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         let ln_funding = crate::ln_funding::Kept::open(&run.join(crate::ln_funding::KEPT_FILE));
         let seller_blocks = crate::seller_block::SellerBlocks::open(&run);
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
-                                ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
+                                ln, ln_error, ln_open, ln_open_error, funding, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), ln_last_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
@@ -699,6 +714,12 @@ impl Signer {
                 sanitize(self.sweep_hot_signed(p))
             }
             "deposit_status" => sanitize(self.deposit_status(p)),
+            "funding_address" => sanitize(self.funding_address()),
+            "funding_status" => sanitize(self.funding_status()),
+            "channel_open" => {
+                let _g = self.lock();
+                sanitize(self.channel_open_signed(p))
+            }
             "deposit_forward" => {
                 let _g = self.lock();
                 sanitize(self.deposit_forward_signed(p))
@@ -891,6 +912,10 @@ impl Signer {
             Ok(s) => s,
             Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
         };
+        // with the open key, a deposit goes only to an address the node itself gave this signer
+        if self.ln_open.is_some() && !self.funding.is_node_address(&to) {
+            return json!({"ok": false, "reason": "that is not an address your Lightning node gave the app: the deposit is forwarded only to one it did"});
+        }
         let found = match crate::deposit::scan(&*self.node, &keys) {
             Ok(f) => f,
             Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
@@ -922,11 +947,109 @@ impl Signer {
         if let Err(e) = self.node.call("sendrawtransaction", json!([tx.to_hex()])) {
             return json!({"ok": false, "reason": format!("the node refused the forwarding transaction: {}", trunc(&e.msg, 200)), "txid": txid});
         }
+        // which coin a channel may be opened from: said beside the result if it could not be written
+        let kept = self.funding.add_forward(&txid, &to, sats_out, self.now() as i64).err().map(|e| e.msg);
         self.engine.audit.append(json!({"type": "deposit_forward", "to": to, "sats": sats_out, "fee_sats": fee, "inputs": coins.len(), "txid": txid,
                                         "ts": ts_value(self.now())}));
         self.anchor_after("deposit_forward");
         self.mine_safe();
-        json!({"ok": true, "to": to, "txid": txid, "sats": sats_out, "fee_sats": fee, "inputs": coins.len(), "left_behind": found.len() - coins.len()})
+        let mut out = json!({"ok": true, "to": to, "txid": txid, "sats": sats_out, "fee_sats": fee, "inputs": coins.len(), "left_behind": found.len() - coins.len()});
+        if let Some(e) = kept {
+            out["record_error"] = trunc(&e, 200).into();
+        }
+        out
+    }
+
+    /// `funding_address`: a new address of the owner's Lightning node, asked for with the open key and
+    /// remembered: the only kind of address a deposit is forwarded to while there is an open key.
+    fn funding_address(&self) -> Value {
+        let Some(node) = &self.ln_open else {
+            return json!({"ok": false, "reason": self.ln_open_error.clone().unwrap_or_else(|| "the app has no key to open channels with".into()), "open_key": false});
+        };
+        let addr = match node.new_address() {
+            Ok(a) => a,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        if address_to_spk(&addr, &self.hrp).is_err() {
+            return json!({"ok": false, "reason": "the Lightning node gave an address of another network"});
+        }
+        match self.funding.add_address(&addr) {
+            Ok(()) => json!({"ok": true, "address": addr}),
+            Err(e) => json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        }
+    }
+
+    /// Confirmations of the forwarded deposit `txid`'s one output, as our node has it: `None` when it is spent or unknown.
+    fn forward_confirmations(&self, txid: &str) -> Option<i64> {
+        let v = self.node.call("gettxout", json!([txid, 0, true])).ok()?;
+        v.get("confirmations").and_then(|c| py_int(Some(c)))
+    }
+
+    /// `funding_status`: whether the app can open channels, the deposits it forwarded (with their confirmations and
+    /// the channel opened from each), and the channels still opening.
+    fn funding_status(&self) -> Value {
+        let forwards: Vec<Value> = self.funding.forwards().into_iter().rev().take(10).map(|mut f| {
+            if f.get("channel").is_none() {
+                f["confirmations"] = f["txid"].as_str().and_then(|t| self.forward_confirmations(t)).map(Value::from).unwrap_or(Value::Null);
+            }
+            f
+        }).collect();
+        let pending = self.ln_open.as_ref().and_then(|n| n.pending().ok()).map(|p| p.len());
+        json!({"ok": true, "open_key": self.ln_open.is_some(), "open_key_error": self.ln_open_error, "forwards": forwards, "opening": pending})
+    }
+
+    /// `channel_open`: one private channel to `peer` (at `host`), funded with the forwarded deposit `forward_txid`
+    /// and nothing else. Needs the human's signature over [`crate::approval::channel_open_message`], used once.
+    /// Only a coin this signer forwarded from the deposit address is spent, once it has a confirmation: its
+    /// funding is then proven by construction ([`crate::deposit`]).
+    fn channel_open_signed(&self, p: &Value) -> Value {
+        let g = |k: &str| str_or_empty(p.get(k)).trim().to_string();
+        let (peer, host, forward) = (g("peer").to_ascii_lowercase(), g("host"), g("forward_txid").to_ascii_lowercase());
+        let Some(expiry) = py_int(p.get("expiry")) else { return json!({"ok": false, "reason": "bad expiry"}) };
+        let Some(node) = &self.ln_open else {
+            return json!({"ok": false, "reason": self.ln_open_error.clone().unwrap_or_else(|| "the app has no key to open channels with".into())});
+        };
+        if !crate::ln_open::valid_pubkey(&peer) || !crate::ln_open::valid_host(&host) {
+            return json!({"ok": false, "reason": "the peer is a node key (66 hex characters) and its address with a port"});
+        }
+        let msg = crate::approval::channel_open_message(&peer, &host, &forward, expiry);
+        let sig = x2b(&str_or_empty(p.get("signature"))).unwrap_or_default();
+        if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &msg, &sig) {
+            return json!({"ok": false, "reason": "channel_open requires a valid human signature"});
+        }
+        if (expiry as f64) < self.now() {
+            return json!({"ok": false, "reason": "channel signature expired"});
+        }
+        let Some(rec) = self.funding.forward(&forward) else {
+            return json!({"ok": false, "reason": "that is not a deposit this app forwarded: a channel is opened only from one"});
+        };
+        if rec.get("channel").is_some() {
+            return json!({"ok": false, "reason": "a channel was already opened from that deposit"});
+        }
+        match self.forward_confirmations(&forward) {
+            Some(c) if c >= 1 => {}
+            Some(_) => return json!({"ok": false, "reason": "the forwarded deposit has no confirmation yet: try again in a few minutes", "wait": true}),
+            None => return json!({"ok": false, "reason": "the forwarded deposit is not an unspent coin on your XBT node"}),
+        }
+        // nothing irreversible yet: a peer that cannot be reached leaves the signature unused
+        if let Err(e) = node.connect(&peer, &host) {
+            return json!({"ok": false, "reason": format!("could not connect to the peer: {}", trunc(&e.msg, 200)), "retry": true});
+        }
+        if let Some(d) = self.check_sig(&msg, p, expiry) {
+            return json!({"ok": false, "reason": d["reason"], "rule": d["rule"]});
+        }
+        let funding_txid = match node.open(&peer, &forward, 0) {
+            Ok(t) => t,
+            Err(e) => return json!({"ok": false, "reason": format!("the Lightning node did not open the channel: {}", trunc(&e.msg, 300))}),
+        };
+        let kept = self.funding.set_channel(&forward, &peer, &funding_txid).err().map(|e| e.msg);
+        self.engine.audit.append(json!({"type": "channel_open", "peer": peer, "host": host, "from": forward, "sats": rec["sats"], "txid": funding_txid,
+                                        "ts": ts_value(self.now())}));
+        let mut out = json!({"ok": true, "peer": peer, "funding_txid": funding_txid, "from": forward, "sats": rec["sats"]});
+        if let Some(e) = kept {
+            out["record_error"] = trunc(&e, 200).into();
+        }
+        out
     }
 
     fn sweep_hot_signed(&self, p: &Value) -> Value {
