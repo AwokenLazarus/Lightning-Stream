@@ -148,6 +148,9 @@ pub struct Config {
     pub relay_unavailable: Option<String>,
     /// `XBT_UI_SUGGESTED_SELLERS`: sellers offered to add in one click.
     pub suggested_sellers: Vec<String>,
+    /// The node the first channel is opened to, as the Add money page fills it in: its key, and the address it is
+    /// reached at (`XBT_UI_FUNDING_PEER=<key>@<host:port>`). The owner can change it there.
+    pub funding_peer: Option<(String, String)>,
     /// `XBT_UI_PLATFORM_LOGIN`: the platform's login proxy, whose requests need no app password.
     pub platform_login: Option<String>,
     /// `XBT_UI_ENROLL_CODE_FILE`: the signer's enrolment code, for the setup page.
@@ -461,6 +464,7 @@ impl Config {
             },
             suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
                 .filter(|s| suggested_seller_ok(s)).take(10).collect()).unwrap_or_default(),
+            funding_peer: env("XBT_UI_FUNDING_PEER").and_then(|v| funding_peer(&v)),
             platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
             enroll_code_file: env("XBT_UI_ENROLL_CODE_FILE").map(PathBuf::from),
             restart_hint: env("XBT_UI_RESTART_HINT").map(|h| h.chars().take(300).collect()).unwrap_or_else(|| RESTART_HINT.into()),
@@ -537,7 +541,7 @@ impl Config {
                relay_ttl: Duration::from_secs(6 * 3600), links_bind: None, links_url: None,
                files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), prefetch: false, relay_dir: None, relay_status: None,
-               relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
+               relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], funding_peer: None, platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), setup_code_hint: None, local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
@@ -550,6 +554,15 @@ impl Config {
 /// key (`npub1…`) that is a valid one.
 pub(crate) fn suggested_seller_ok(s: &str) -> bool {
     xbt402::shop::parse(s).is_some_and(|o| crate::services::http_origin(&o).is_some())
+}
+
+/// `<key>@<host:port>` as a peer: a node key (66 hex characters) and where it is reached.
+pub fn funding_peer(v: &str) -> Option<(String, String)> {
+    let (pk, host) = v.trim().split_once('@')?;
+    let pk = pk.to_ascii_lowercase();
+    let ok_host = host.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0))
+        && host.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'[' | b']' | b':'));
+    (pk.len() == 66 && pk.bytes().all(|c| c.is_ascii_hexdigit()) && ok_host).then(|| (pk, host.to_string()))
 }
 
 #[cfg(test)]

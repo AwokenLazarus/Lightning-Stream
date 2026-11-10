@@ -182,7 +182,9 @@
     deny: function (f) { return joinLines(["xbt-agentwallet-deny-v1", f.token, String(f.expiry)]); },
     unblock: function (f) { return joinLines(["xbt-agentwallet-unblock-v1", f.block, String(f.expiry)]); },
     // the first deposit, moved from the box's deposit address to the owner's Lightning node
-    deposit: function (f) { return joinLines(["xbt-agentwallet-deposit-forward-v1", f.deposit_address, f.to, String(f.expiry)]); }
+    deposit: function (f) { return joinLines(["xbt-agentwallet-deposit-forward-v1", f.deposit_address, f.to, String(f.expiry)]); },
+    // the first channel, opened by the box to the peer named, from the forwarded deposit
+    channel: function (f) { return joinLines(["xbt-agentwallet-channel-open-v1", f.peer, f.host, f.forward_txid, String(f.expiry)]); }
   };
 
   // ---- the key in this browser: the seed XORed with a PBKDF2 pad of the passphrase, and a MAC ------

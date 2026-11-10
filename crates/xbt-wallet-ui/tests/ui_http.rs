@@ -6471,3 +6471,13 @@ fn add_money_shows_the_deposit_address_finds_the_deposit_and_moves_it_on_approva
     assert!(said.contains("on their way") && said.contains(&format!("{},{:03}", (300_000 - fee) / 1000, (300_000 - fee) % 1000)), "{said}");
     assert!(br.get("/add-money?check=1").body.contains("Not arrived yet"), "the address is empty again");
 }
+
+/// `XBT_UI_FUNDING_PEER` is a node key and where it is reached, or nothing.
+#[test]
+fn the_funding_peer_is_a_key_and_an_address_with_a_port() {
+    let pk = format!("02{}", "AB".repeat(32));
+    assert_eq!(xbt_wallet_ui::config::funding_peer(&format!("{pk}@203.0.113.7:9735")), Some((pk.to_ascii_lowercase(), "203.0.113.7:9735".to_string())));
+    for bad in [format!("{pk}@203.0.113.7"), format!("{pk}@a b:9735"), "02ab@host:9735".to_string(), pk.clone(), format!("{pk}@host:9735/x")] {
+        assert_eq!(xbt_wallet_ui::config::funding_peer(&bad), None, "{bad}");
+    }
+}

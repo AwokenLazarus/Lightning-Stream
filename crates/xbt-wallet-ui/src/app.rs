@@ -735,7 +735,32 @@ impl App {
                 else { String::new() }));
         }
         b.push_str("<p><a class=\"button-link\" href=\"./add-money?check=1\">Check for my deposit</a> <span class=\"small\">On a small box the check can take a minute or two.</span></p></section>");
-        if check && found > 0 {
+        // with the open key the box does the rest: the node's own address, then the channel
+        let funding = self.call("funding_status", json!({})).unwrap_or(Value::Null);
+        let auto = funding["open_key"] == true;
+        if check && found > 0 && auto {
+            let human = self.human_pub();
+            let exp = now() + SIGN_WINDOW_S;
+            b.push_str(&format!("<section class=\"card\"><h2>3. Move it to your Lightning node</h2><p>{} sats will arrive there ({} sats network fee).</p>",
+                                crate::html::group3((found - int(st.get("fee_sats"))).max(0) as u64), crate::html::group3(int(st.get("fee_sats")).max(0) as u64)));
+            match self.call("funding_address", json!({})) {
+                _ if human.is_empty() => b.push_str("<p>Set up approvals first: <a href=\"./setup\">finish the setup</a>.</p>"),
+                Ok(a) if ok_of(&a) => {
+                    let to = txt(a.get("address"));
+                    b.push_str(&self.signed_form(ctx, "./deposit-forward", "deposit", &human,
+                        &[("deposit_address", addr.clone()), ("to", to.clone()), ("expiry", exp.to_string())],
+                        &format!("<p class=\"small\">To your node's own address <code class=\"mono\">{}</code>, which the app asked it for.</p>", esc(&to)),
+                        "Approve and move it", Ext::Bytes(msg::deposit_forward(&addr, &to, exp))));
+                }
+                Ok(a) => b.push_str(&Self::error_box(&reason_of(&a))),
+                Err(e) => b.push_str(&Self::error_box(&e)),
+            }
+            b.push_str("</section>");
+        }
+        if auto {
+            b.push_str(&self.open_connection_html(ctx, &funding));
+        }
+        if check && found > 0 && !auto {
             let human = self.human_pub();
             let exp = now() + SIGN_WINDOW_S;
             b.push_str(&format!("<section class=\"card\"><h2>3. Move it to your Lightning node</h2><p>{} sats will arrive there ({} sats network fee).</p>",
@@ -752,6 +777,46 @@ impl App {
             b.push_str("</section>");
         }
         self.page("Add money", ctx, b)
+    }
+
+    /// The last step of Add money, where the box opens the channel itself: each deposit moved to the node, and for
+    /// one that has a confirmation and no channel yet, the approval that opens the connection.
+    fn open_connection_html(&self, ctx: &Ctx, funding: &Value) -> String {
+        let forwards = funding["forwards"].as_array().cloned().unwrap_or_default();
+        if forwards.is_empty() {
+            return String::new();
+        }
+        let mut b = String::from("<section class=\"card\" id=\"open-connection\"><h2>4. Open your connection</h2>");
+        let human = self.human_pub();
+        let (peer, host) = self.cfg.funding_peer.clone().unwrap_or_default();
+        for f in &forwards {
+            let (txid, amount) = (txt(f.get("txid")), crate::html::group3(int(f.get("sats")).max(0) as u64));
+            if f.get("channel").is_some() {
+                b.push_str(&format!("<p><span class=\"pill good\">Opening</span> {amount} sats: your connection is opening. It is ready to pay through \
+                    after about an hour (6 confirmations). Then your <a href=\"./wallet\">Wallet</a> shows what you can spend.</p>"));
+            } else if f["confirmations"].as_i64().is_some_and(|c| c >= 1) && !human.is_empty() {
+                let exp = now() + SIGN_WINDOW_S;
+                b.push_str(&format!("<p><span class=\"pill good\">Arrived at your node</span> {amount} sats. One approval opens your connection with them: \
+                    almost all becomes your balance; the opening fee and a small reserve your node keeps are not spendable.</p>"));
+                b.push_str(&self.signed_form(ctx, "./channel-open", "channel", &human, &[("forward_txid", txid.clone()), ("expiry", exp.to_string())],
+                    &format!("<details{}><summary>Who you connect to{}</summary>\
+                        <label>Node key<input name=\"peer\" class=\"mono\" value=\"{}\" autocomplete=\"off\" required pattern=\"0[23][0-9a-fA-F]{{64}}\"></label>\
+                        <label>Its address<input name=\"host\" class=\"mono\" value=\"{}\" autocomplete=\"off\" required placeholder=\"host:9735\"></label>\
+                        <p class=\"small\">Your payments to shops travel through this node. It never holds your money: the connection is yours, \
+                        and you can close it from your Lightning node's app at any time.</p></details>",
+                        if peer.is_empty() { " open" } else { "" }, if peer.is_empty() { "" } else { ": the suggested node, change it if you like" },
+                        esc(&peer), esc(&host)),
+                    "Approve and open", Ext::Lines(format!("xbt-agentwallet-channel-open-v1\n(the node key)\n(its address)\n{txid}\n{exp}"))));
+            } else if f["confirmations"].is_null() {
+                b.push_str(&format!("<p><span class=\"pill warn\">Not found</span> {amount} sats moved to your node, but the coin is not there to open a \
+                    connection with: it may have been spent from your node's own app.</p>"));
+            } else {
+                b.push_str(&format!("<p><span class=\"pill warn\">On its way</span> {amount} sats are on their way to your node. After one confirmation \
+                    (about 10 minutes) the last step shows here. <a href=\"./add-money\">Look again</a></p>"));
+            }
+        }
+        b.push_str("</section>");
+        b
     }
 
     /// `GET /limits`: the three limits most owners ever change, as sliders. Each slider moves over [`LIMIT_STEPS`] and
@@ -959,6 +1024,9 @@ impl App {
             "/advanced" => self.advanced_post(ctx, f),
             "/favorite" => self.favorite_post(ctx, f),
             "/limits" => self.limits_post(ctx, f),
+            "/channel-open" => back("./add-money", self.call("channel_open", json!({"peer": g("peer").to_ascii_lowercase(), "host": g("host"),
+                                        "forward_txid": g("forward_txid"), "expiry": i("expiry"), "signature": sig()})),
+                                    &|_| "Your connection is opening. It is ready to pay through after about an hour (6 confirmations); nothing more to do.".into()),
             "/deposit-forward" => back("./add-money", self.call("deposit_forward", json!({"to": g("to"), "expiry": i("expiry"), "signature": sig()})),
                                        &|v| format!("{} sats are on their way to your Lightning node. They are there after one confirmation, about 10 minutes.",
                                                     crate::html::group3(int(v.get("sats")).max(0) as u64))),

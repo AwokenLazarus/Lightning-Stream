@@ -18,6 +18,10 @@ pub fn deposit_forward(deposit_address: &str, to: &str, expiry: i64) -> Vec<u8> 
     join(&["xbt-agentwallet-deposit-forward-v1", deposit_address, to, &expiry.to_string()])
 }
 
+pub fn channel_open(peer: &str, host: &str, forward_txid: &str, expiry: i64) -> Vec<u8> {
+    join(&["xbt-agentwallet-channel-open-v1", peer, host, forward_txid, &expiry.to_string()])
+}
+
 pub fn policy(prev_sha256: &str, expiry: i64, text: &str) -> Vec<u8> {
     join(&["xbt-agentwallet-policy-v1", prev_sha256, &expiry.to_string(), text])
 }
