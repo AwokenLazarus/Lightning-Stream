@@ -347,7 +347,8 @@ def main():
         except Exception:
             procs.append(start_signer(root, sock, ln_env, f"{RUN}/signer.log"))
         run_hop(sock, human, lf2_pub)
-        run_open(human, human_pub, lf2_pub, ln_env, procs)
+        run_open(human, human_pub, lf2_pub, procs)
+        run_open(human, human_pub, lf2_pub, procs, svc="lf3", port=17495, tag="S32", deposit="0.0026", fresh=True)
     finally:
         mcp.close()
         for p in procs:
@@ -397,34 +398,43 @@ def run_hop(sock, human, lf2_pub):
           pin.get("pinned_by") == "a 0x21 signature in a scriptSig" and pin.get("generations") == 1, pin)
 
 
-def run_open(human, human_pub, lf2_pub, ln_env, procs):
+def run_open(human, human_pub, lf2_pub, procs, svc="lf1", port=17491, tag="S31", deposit="0.005", fresh=False):
     """S31, the open key (xbt-signer::ln_open): a wallet with a second key of the node, for the funding step
     only. The deposit goes to an address the node gave, and the signer itself opens one private channel from the
     forwarded deposit, on the owner's signature; the channel's funding is proven."""
-    ln("lf1", "bakemacaroon", "--save_to=/tmp/open.macaroon", "address:write", "offchain:read", "offchain:write", "onchain:read", "onchain:write", "peers:write")
-    fetch("lf1", "/tmp/open.macaroon", f"{RUN}/lf1.open.macaroon")
-    root = f"{RUN}/wallet-open"
+    ln(svc, "bakemacaroon", "--save_to=/tmp/open.macaroon", "address:write", "offchain:read", "offchain:write", "onchain:read", "onchain:write", "peers:write")
+    fetch(svc, "/tmp/open.macaroon", f"{RUN}/{svc}.open.macaroon")
+    bake(svc, f"{RUN}/{svc}.hop.macaroon")
+    fetch(svc, "/root/.lnd/tls.cert", f"{RUN}/{svc}.hop.tls.cert")
+    ln_env = {"B2_LN_REST": f"https://127.0.0.1:{port}", "B2_LN_MACAROON": f"{RUN}/{svc}.hop.macaroon", "B2_LN_TLS_CERT": f"{RUN}/{svc}.hop.tls.cert"}
+    if fresh:
+        # a new owner's node: no coin of its own on chain, so the deposit is all the channel and its reserve can come from
+        if int(ln(svc, "walletbalance")["confirmed_balance"]) > 0:
+            ln(svc, "sendcoins", "--sweepall", "--force", f"--addr={b2b('-rpcwallet=lab', 'getnewaddress', '', 'bech32')}")
+            t = mine(1)
+            wait(f"{svc} swept", 60, lambda: synced(svc, t) and int(ln(svc, "walletbalance")["total_balance"]) == 0)
+    root = f"{RUN}/wallet-open-{svc}"
     os.makedirs(f"{root}/.run", exist_ok=True)
     with open(f"{root}/policy.json", "w") as f:
         json.dump(policy(human_pub, [f"ln:{lf2_pub}"]), f, indent=2)
-    sock = f"{RUN}/signer-open.sock"
-    procs.append(start_signer(root, sock, dict(ln_env, B2_LN_OPEN_MACAROON=f"{RUN}/lf1.open.macaroon"), f"{RUN}/signer-open.log"))
+    sock = f"{RUN}/signer-open-{svc}.sock"
+    procs.append(start_signer(root, sock, dict(ln_env, B2_LN_OPEN_MACAROON=f"{RUN}/{svc}.open.macaroon"), f"{RUN}/signer-open-{svc}.log"))
     st = rpc_sock(sock, "funding_status")
-    check("S31 the wallet has the open key", st.get("open_key") is True, st)
+    check(f"{tag} the wallet has the open key", st.get("open_key") is True, st)
     dep = rpc_sock(sock, "deposit_status").get("address", "")
-    b2b("-rpcwallet=lab", "sendtoaddress", dep, "0.005")
+    b2b("-rpcwallet=lab", "sendtoaddress", dep, deposit)
     mine(1)
     exp = int(time.time()) + 600
     elsewhere = b2b("-rpcwallet=lab", "getnewaddress", "", "bech32")
     msg = b"\n".join([b"xbt-agentwallet-deposit-forward-v1", dep.encode(), elsewhere.encode(), str(exp).encode()])
     r = rpc_sock(sock, "deposit_forward", {"to": elsewhere, "expiry": exp, "signature": human.sign(msg).hex()})
-    check("S31 a deposit is not forwarded to an address the node did not give", r.get("ok") is False and "Lightning node gave" in r.get("reason", ""), r)
+    check(f"{tag} a deposit is not forwarded to an address the node did not give", r.get("ok") is False and "Lightning node gave" in r.get("reason", ""), r)
     a = rpc_sock(sock, "funding_address")
     to = a.get("address", "")
-    check("S31 the node gives the wallet an address of its own", a.get("ok") is True and to.startswith("bcrt1q"), a)
+    check(f"{tag} the node gives the wallet an address of its own", a.get("ok") is True and to.startswith("bcrt1q"), a)
     msg = b"\n".join([b"xbt-agentwallet-deposit-forward-v1", dep.encode(), to.encode(), str(exp).encode()])
     f = rpc_sock(sock, "deposit_forward", {"to": to, "expiry": exp, "signature": human.sign(msg).hex()})
-    check("S31 the deposit is forwarded to it", f.get("ok") is True, f)
+    check(f"{tag} the deposit is forwarded to it", f.get("ok") is True, f)
     if f.get("ok") is not True:
         return
     host = "lf2:9735"
@@ -433,36 +443,44 @@ def run_open(human, human_pub, lf2_pub, ln_env, procs):
         m = b"\n".join([b"xbt-agentwallet-channel-open-v1", lf2_pub.encode(), host.encode(), f["txid"].encode(), str(e).encode()])
         return rpc_sock(sock, "channel_open", {"peer": lf2_pub, "host": host, "forward_txid": f["txid"], "expiry": e, "signature": human.sign(m).hex()})
     early = ask()
-    check("S31 no channel before the forwarded deposit confirms", early.get("ok") is False and early.get("wait") is True, early)
+    check(f"{tag} no channel before the forwarded deposit confirms", early.get("ok") is False and early.get("wait") is True, early)
     tip = mine(1)
-    wait("lf1 and lf2 at the tip", 60, lambda: synced("lf1", tip) and synced("lf2", tip))
-    before = {c["channel"]["channel_point"] for c in ln("lf1", "pendingchannels")["pending_open_channels"]}
+    wait(f"{svc} and lf2 at the tip", 60, lambda: synced(svc, tip) and synced("lf2", tip))
+    before = {c["channel"]["channel_point"] for c in ln(svc, "pendingchannels")["pending_open_channels"]}
     o = {}
     for i in range(6):
         o = ask()
         if o.get("ok") is True or "internal error" not in json.dumps(o):
             break
         time.sleep(5)
-    REPORT["scenarios"]["S31_open"] = o
-    check("S31 the signer opens the channel itself, on the owner's signature", o.get("ok") is True and len(o.get("funding_txid", "")) == 64, o)
+    REPORT["scenarios"][f"{tag}_open"] = o
+    check(f"{tag} the signer opens the channel itself, on the owner's signature", o.get("ok") is True and len(o.get("funding_txid", "")) == 64, o)
     if o.get("ok") is not True:
         return
-    pend = [c["channel"] for c in ln("lf1", "pendingchannels")["pending_open_channels"] if c["channel"]["channel_point"] not in before]
-    check("S31 one channel is opening, private, to the chosen peer", len(pend) == 1 and pend[0]["remote_node_pub"] == lf2_pub and pend[0].get("private") is True
+    pend = [c["channel"] for c in ln(svc, "pendingchannels")["pending_open_channels"] if c["channel"]["channel_point"] not in before]
+    check(f"{tag} one channel is opening, private, to the chosen peer", len(pend) == 1 and pend[0]["remote_node_pub"] == lf2_pub and pend[0].get("private") is True
           and pend[0]["channel_point"].startswith(o["funding_txid"]), pend)
     ftx = json.loads(b2b("getrawtransaction", o["funding_txid"], "true"))
-    check("S31 it is funded from the forwarded deposit alone", [(v["txid"], v["vout"]) for v in ftx.get("vin", [])] == [(f["txid"], 0)], ftx.get("vin"))
+    check(f"{tag} it is funded from the forwarded deposit alone", [(v["txid"], v["vout"]) for v in ftx.get("vin", [])] == [(f["txid"], 0)], ftx.get("vin"))
     again = ask()
-    check("S31 a second channel from the same deposit is refused", again.get("ok") is False and "already opened" in again.get("reason", ""), again)
+    check(f"{tag} a second channel from the same deposit is refused", again.get("ok") is False and "already opened" in again.get("reason", ""), again)
     mine(6)
-    wait("the opened channel active", 90, lambda: any(c["channel_point"].startswith(o["funding_txid"]) for c in ln("lf1", "listchannels", "--active_only")["channels"]))
+    wait("the opened channel active", 90, lambda: any(c["channel_point"].startswith(o["funding_txid"]) for c in ln(svc, "listchannels", "--active_only")["channels"]))
     st = rpc_sock(sock, "ln_status")
     ours = [c for c in st.get("channels", []) if (c.get("funding") or {}).get("evidence", {}).get("txid") == o["funding_txid"]]
-    REPORT["scenarios"]["S31_channel"] = ours
+    REPORT["scenarios"][f"{tag}_channel"] = ours
     fd = ours[0].get("funding", {}) if ours else {}
     pin = fd.get("evidence", {}).get("xbt_only", {})
-    check("S31 the channel is usable, its funding proven, pinned one transaction behind it",
+    check(f"{tag} the channel is usable, its funding proven, pinned one transaction behind it",
           bool(ours) and ours[0].get("usable") is True and fd.get("proven") is True and pin.get("generations") == 1, ours)
+    if fresh:
+        cap = [int(c["capacity"]) for c in ln(svc, "listchannels")["channels"] if c["channel_point"].startswith(o["funding_txid"])]
+        left = int(ln(svc, "walletbalance")["confirmed_balance"])
+        sent = int(float(deposit) * 1e8)
+        REPORT["scenarios"][f"{tag}_amounts"] = {"deposit": sent, "channel": cap, "left_on_chain": left}
+        print(f"{tag}: deposit {sent}, channel {cap}, left on chain {left}", flush=True)
+        check(f"{tag} from a wallet with nothing else, the deposit becomes the channel, less fees and the node's reserve",
+              len(cap) == 1 and sent - 30_000 <= cap[0] + left <= sent and cap[0] >= sent - 40_000, {"deposit": sent, "channel": cap, "left_on_chain": left})
 
 
 def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
