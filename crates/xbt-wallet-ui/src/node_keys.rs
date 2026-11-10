@@ -381,7 +381,8 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
         // a box's first rail key (a new install): the open key with it, and before it, so the signer that starts on the
         // rail key finds both. A box that pays already is given no wider key by itself; a node that will not bake it
         // leaves the owner to open the channel in the node's own app
-        let first_rail = s.rail_dir.as_ref() == Some(dir) && !dir.join(RAIL_MACAROON).is_file() && !dir.join(OPEN_MACAROON).is_file()
+        // (a box that made its keys before and was disconnected is no new install: reconnecting brings the rail key back alone)
+        let first_rail = s.rail_dir.as_ref() == Some(dir) && !dir.join(RAIL_MACAROON).is_file() && !dir.join(OPEN_MACAROON).is_file() && !made_before(dir)
             && !s.bake_to.as_ref().is_some_and(|h| h.join(RAIL_MACAROON).is_file() || h.join(OPEN_MACAROON).is_file());
         if first_rail {
             let id = root_key_id();
