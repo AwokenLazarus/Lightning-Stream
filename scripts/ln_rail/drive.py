@@ -407,12 +407,18 @@ def run_open(human, human_pub, lf2_pub, procs, svc="lf1", port=17491, tag="S31",
     bake(svc, f"{RUN}/{svc}.hop.macaroon")
     fetch(svc, "/root/.lnd/tls.cert", f"{RUN}/{svc}.hop.tls.cert")
     ln_env = {"B2_LN_REST": f"https://127.0.0.1:{port}", "B2_LN_MACAROON": f"{RUN}/{svc}.hop.macaroon", "B2_LN_TLS_CERT": f"{RUN}/{svc}.hop.tls.cert"}
+    try:
+        ln(svc, "disconnect", lf2_pub)
+    except RuntimeError:
+        pass
     if fresh:
         # a new owner's node: no coin of its own on chain, so the deposit is all the channel and its reserve can come from
         if int(ln(svc, "walletbalance")["confirmed_balance"]) > 0:
             ln(svc, "sendcoins", "--sweepall", "--force", f"--addr={b2b('-rpcwallet=lab', 'getnewaddress', '', 'bech32')}")
             t = mine(1)
-            wait(f"{svc} swept", 60, lambda: synced(svc, t) and int(ln(svc, "walletbalance")["total_balance"]) == 0)
+            wait(f"{svc} at the tip after its sweep", 60, lambda: synced(svc, t) and int(ln(svc, "walletbalance")["unconfirmed_balance"]) == 0)
+    # what the node keeps for itself whatever is swept (its reserve for a channel it has already)
+    held = int(ln(svc, "walletbalance")["confirmed_balance"])
     root = f"{RUN}/wallet-open-{svc}"
     os.makedirs(f"{root}/.run", exist_ok=True)
     with open(f"{root}/policy.json", "w") as f:
@@ -475,12 +481,12 @@ def run_open(human, human_pub, lf2_pub, procs, svc="lf1", port=17491, tag="S31",
           bool(ours) and ours[0].get("usable") is True and fd.get("proven") is True and pin.get("generations") == 1, ours)
     if fresh:
         cap = [int(c["capacity"]) for c in ln(svc, "listchannels")["channels"] if c["channel_point"].startswith(o["funding_txid"])]
-        left = int(ln(svc, "walletbalance")["confirmed_balance"])
+        left = int(ln(svc, "walletbalance")["confirmed_balance"]) - held
         sent = int(float(deposit) * 1e8)
-        REPORT["scenarios"][f"{tag}_amounts"] = {"deposit": sent, "channel": cap, "left_on_chain": left}
-        print(f"{tag}: deposit {sent}, channel {cap}, left on chain {left}", flush=True)
+        REPORT["scenarios"][f"{tag}_amounts"] = {"deposit": sent, "channel": cap, "left_on_chain": left, "held_before": held}
+        print(f"{tag}: deposit {sent}, channel {cap}, left on chain beyond the {held} held before: {left}", flush=True)
         check(f"{tag} from a wallet with nothing else, the deposit becomes the channel, less fees and the node's reserve",
-              len(cap) == 1 and sent - 30_000 <= cap[0] + left <= sent and cap[0] >= sent - 40_000, {"deposit": sent, "channel": cap, "left_on_chain": left})
+              len(cap) == 1 and sent - 30_000 <= cap[0] + left <= sent and cap[0] >= sent - 40_000, {"deposit": sent, "channel": cap, "left_on_chain": left, "held_before": held})
 
 
 def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
