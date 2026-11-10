@@ -342,7 +342,7 @@ export function services(cfg: Config): ServiceSpec[] {
       env: {
         ...node,
         ...(ln
-          ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_MAINNET_ACK_FILE: '/data/run/ln/mainnet-ack', B2_LN_TLS_CERT: LIGHTNING.cert }
+          ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_LN_OPEN_MACAROON: '/data/run/ln/open.macaroon', B2_MAINNET_ACK_FILE: '/data/run/ln/mainnet-ack', B2_LN_TLS_CERT: LIGHTNING.cert }
           : {}),
         B2_STREAM_DIR: '/data/run/signer/streams',
         // a copy of the one-time enrolment code for the setup page (run/enroll: the signer and the UI only)

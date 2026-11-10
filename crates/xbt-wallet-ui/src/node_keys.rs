@@ -268,8 +268,26 @@ pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake, 
     let mut out = Outcome::default();
     let old = read_record(rail_dir)[RAIL_MACAROON]["root_key_id"].as_str().and_then(|i| i.parse::<u64>().ok())
         .filter(|_| rail_dir.join(RAIL_MACAROON).is_file());
+    // a box's first connection (never a key here before): the open key with it, as [`make_keys`] does for a new install
+    let first = old.is_none() && !rail_dir.join(RAIL_MACAROON).is_file() && !rail_dir.join(OPEN_MACAROON).is_file() && !made_before(rail_dir);
     let id = root_key_id();
     let mac = bake(&RAIL_OPS, id)?;
+    if first {
+        let oid = root_key_id();
+        // before the rail key, so the signer that starts on it finds both; a node that will not bake it leaves the
+        // channel to the owner
+        match bake(&OPEN_OPS, oid) {
+            Ok(m) => match write_shared(rail_dir, OPEN_MACAROON, &m).and_then(|()| record_by(rail_dir, OPEN_MACAROON, oid, &OPEN_OPS, BY_ADDRESS)) {
+                Ok(()) => out.made.push(OPEN_MACAROON.into()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(rail_dir.join(OPEN_MACAROON));
+                    drop_baked(rail_dir, revoke, oid, &mut out);
+                    out.skipped.push((OPEN_MACAROON.into(), e));
+                }
+            },
+            Err(e) => out.skipped.push((OPEN_MACAROON.into(), e)),
+        }
+    }
     if let Err(e) = write_shared(rail_dir, RAIL_MACAROON, &mac) {
         drop_baked(rail_dir, revoke, id, &mut out);
         return Err(e);
@@ -818,7 +836,12 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
         let bake = |ops: &[&str], _: u64| -> Result<Vec<u8>, String> { Ok(mac_of(ops)) };
-        make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |_| Ok(())).unwrap();
+        // the first connection of a box makes the open key too; it is no key a later paste replaces
+        let o = make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |_| Ok(())).unwrap();
+        assert_eq!(o.made, vec![OPEN_MACAROON, RAIL_MACAROON]);
+        assert_eq!(std::fs::read(rail.join(OPEN_MACAROON)).unwrap(), mac_of(&OPEN_OPS));
+        let open_id = read_record(&rail)[OPEN_MACAROON]["root_key_id"].as_str().unwrap().to_string();
+        let root_key_ids = |d: &Path| -> Vec<String> { super::root_key_ids(d).into_iter().filter(|i| *i != open_id).collect() };
         let first = root_key_ids(&rail);
         assert_eq!(first.len(), 1);
         let mut revoked = vec![];
@@ -827,6 +850,7 @@ mod tests {
         let second = root_key_ids(&rail);
         assert_eq!(second.len(), 1);
         assert_ne!(second, first);
+        assert_eq!(read_record(&rail)[OPEN_MACAROON]["root_key_id"].as_str(), Some(open_id.as_str()), "the open key is made once, and stays");
         // the node won't revoke: the old id stays listed, beside the new one
         let o = make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |_| Err("node unreachable".into())).unwrap();
         assert_eq!(o.made, vec![RAIL_MACAROON]);
