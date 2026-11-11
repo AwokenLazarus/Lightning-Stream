@@ -345,6 +345,12 @@ impl App {
             "<p class=\"lead\">The app pays for services through your own Lightning node. Connect it once with a key \
              you make in your node's app. The key lets the app pay within your spending rules; it cannot open or close channels.</p>"
         });
+        // a new install holds a second key, for Add money's steps: said where the first is said to open no channel
+        if ln.dir.join(OPEN_MACAROON).is_file() {
+            b.push_str("<p>The app also holds a second key, used only when you approve a step on <a href=\"./add-money\">Add money</a>: with it the \
+                        app asks your node for an address and opens your first connection from your deposit. It is listed below, and you can \
+                        revoke it once your connection is open.</p>");
+        }
         let needs_ack = have && main && (!acked || status["real_money_ack_needed"] == true);
         b.push_str(&format!("<section class=\"status {}\"><p class=\"status-head\">{}</p><p>{}</p></section>",
             if ready { "ok" } else if have { "warn" } else { "bad" },

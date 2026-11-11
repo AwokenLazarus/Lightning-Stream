@@ -3461,6 +3461,7 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     let mut br = logged_in(&b);
     let page = br.get("/lightning").body;
     assert!(page.contains("Key to open your first connection") && page.contains("address:write"), "{page}");
+    assert!(page.contains("The app also holds a second key"), "the page that says the first key opens no channel says there is a second: {page}");
     assert!(page.contains("connected by itself") && page.contains("made by the app") && page.contains("root key id "), "{page}");
     assert!(page.contains("Advanced: use a key of your own instead") && !page.contains(&rail), "{page}");
     assert!(page.contains("Before you uninstall") && page.contains("deletemacaroonid"), "{page}");
