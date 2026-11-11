@@ -73,6 +73,9 @@ impl xbt_signer::ln_open::OpenBackend for FakeOpen {
         Ok(TO.to_string())
     }
     fn connect(&self, pubkey: &str, host: &str) -> xbt402::Result<()> {
+        if host.starts_with("192.0.2.") {
+            return Err(xbt_signer::err("ln_backend", "dial tcp: no route"));
+        }
         if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(xbt_signer::err("ln_backend", "dial tcp: i/o timeout"));
         }
@@ -132,6 +135,8 @@ fn with_the_open_key_the_deposit_goes_to_the_node_and_one_channel_opens_from_it(
     let r = call(&s, "channel_open", json!({"peer": other, "host": host, "forward_txid": fwd, "expiry": exp,
         "signature": sign_human(&channel_open_message(&peer, host, &fwd, exp))}));
     assert!(r["ok"] == false && r["reason"].as_str().unwrap().contains("human signature"), "{r}");
+    // two addresses, the first unreachable: the second is tried, with no second approval
+    // (covered below by `the_peers_second_address_is_tried_when_the_first_cannot_be_reached`)
     // a peer that cannot be reached: nothing opened, and the same signature works once it can
     node.unreachable.store(true, std::sync::atomic::Ordering::SeqCst);
     let r = open(&fwd, &peer, exp);
@@ -162,4 +167,32 @@ fn without_the_open_key_no_address_is_given_and_no_channel_opens() {
     let r = rig.call("channel_open", json!({"peer": peer, "host": "203.0.113.7:9735", "forward_txid": "00".repeat(32), "expiry": exp,
         "signature": sign_human(&xbt_signer::approval::channel_open_message(&peer, "203.0.113.7:9735", &"00".repeat(32), exp))}));
     assert!(r["ok"] == false && r["reason"].as_str().unwrap().contains("no key to open channels"), "{r}");
+}
+
+/// A node with two addresses: where the first cannot be reached the second is tried, on the one approval that names both.
+#[test]
+fn the_peers_second_address_is_tried_when_the_first_cannot_be_reached() {
+    use xbt_signer::approval::channel_open_message;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let node = std::sync::Arc::new(FakeOpen::default());
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln_open: Some(node.clone()), ..Default::default() }).unwrap();
+    let st = call(&s, "deposit_status", json!({}));
+    chain.credit(&hex::encode([0x72; 32]), 0, 250_000, st["script"].as_str().unwrap(), true);
+    let exp = xbt_signer::pyjson::now_f64() as i64 + 600;
+    call(&s, "funding_address", json!({}));
+    let f = call(&s, "deposit_forward", json!({"to": TO, "expiry": exp, "signature": sign_human(&deposit_forward_message(st["address"].as_str().unwrap(), TO, exp))}));
+    chain.mine(1);
+    let (peer, fwd) = (format!("02{}", "ab".repeat(32)), f["txid"].as_str().unwrap().to_string());
+    let open = |host: &str| call(&s, "channel_open", json!({"peer": peer, "host": host, "forward_txid": fwd, "expiry": exp,
+        "signature": sign_human(&channel_open_message(&peer, host, &fwd, exp))}));
+    let r = open("192.0.2.1:9735");
+    assert!(r["ok"] == false && r["retry"] == true && r["reason"].as_str().unwrap().contains("could not reach that node at 192.0.2.1:9735"), "{r}");
+    let r = open("192.0.2.1:9735, node.onion:9735");
+    assert_eq!((r["ok"].as_bool(), r["reached_at"].as_str()), (Some(true), Some("node.onion:9735")), "{r}");
+    assert_eq!(node.calls.lock().unwrap().last().unwrap(), &format!("open {peer} {fwd}:0"));
+    assert_eq!(open("192.0.2.1:9735,not an address")["ok"], false);
 }

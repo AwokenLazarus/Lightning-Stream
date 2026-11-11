@@ -796,8 +796,8 @@ impl App {
         // the box's own choice, else on mainnet the demo shop's node (it has both addresses: the other is said below)
         let genesis = self.cfg.funding_peer.is_none() && self.signer_chain() == "main";
         let (peer, host) = self.cfg.funding_peer.clone()
-            .or_else(|| genesis.then(|| (GENESIS_NODE.to_string(), GENESIS_HOST.to_string()))).unwrap_or_default();
-        let other = if genesis { format!(" If it cannot be reached at that address, use its other one: <code class=\"mono\">{GENESIS_ONION}</code>.") } else { String::new() };
+            .or_else(|| genesis.then(|| (GENESIS_NODE.to_string(), format!("{GENESIS_HOST},{GENESIS_ONION}")))).unwrap_or_default();
+        let other = " A node with more than one address: write them with commas between, and they are tried in order.";
         for f in &forwards {
             let (txid, amount) = (txt(f.get("txid")), crate::html::group3(int(f.get("sats")).max(0) as u64));
             if f.get("channel").is_some() {

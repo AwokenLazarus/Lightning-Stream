@@ -1009,9 +1009,10 @@ impl Signer {
         let Some(node) = &self.ln_open else {
             return json!({"ok": false, "reason": self.ln_open_error.clone().unwrap_or_else(|| "the app has no key to open channels with".into())});
         };
-        if !crate::ln_open::valid_pubkey(&peer) || !crate::ln_open::valid_host(&host) {
-            return json!({"ok": false, "reason": "the peer is a node key (66 hex characters) and its address with a port"});
-        }
+        // the peer's addresses, tried in order: all of them are in the message the owner signs
+        let Some(hosts) = crate::ln_open::hosts(&host).filter(|_| crate::ln_open::valid_pubkey(&peer)) else {
+            return json!({"ok": false, "reason": "the peer is a node key (66 hex characters) and its address with a port (a few addresses, separated by commas, are tried in order)"});
+        };
         let msg = crate::approval::channel_open_message(&peer, &host, &forward, expiry);
         let sig = x2b(&str_or_empty(p.get("signature"))).unwrap_or_default();
         if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &msg, &sig) {
@@ -1032,9 +1033,20 @@ impl Signer {
             None => return json!({"ok": false, "reason": "the forwarded deposit is not an unspent coin on your XBT node"}),
         }
         // nothing irreversible yet: a peer that cannot be reached leaves the signature unused
-        if let Err(e) = node.connect(&peer, &host) {
-            return crate::ln::node_said(json!({"ok": false, "reason": format!("could not connect to the peer: {}", trunc(&e.msg, 200)), "retry": true}), &e);
-        }
+        let mut failed = None;
+        let reached = hosts.iter().find(|h| match node.connect(&peer, h) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            }
+        }).copied();
+        let Some(reached) = reached else {
+            let e = failed.unwrap_or_else(|| crate::err("ln_open", "no address"));
+            return crate::ln::node_said(json!({"ok": false, "retry": true, "reason": format!(
+                "your Lightning node could not reach that node at {} ({}). Nothing was opened: try again in a few minutes, or choose another node.",
+                hosts.join(" or "), trunc(&e.msg, 120))}), &e);
+        };
         if let Some(d) = self.check_sig(&msg, p, expiry) {
             return json!({"ok": false, "reason": d["reason"], "rule": d["rule"]});
         }
@@ -1045,7 +1057,7 @@ impl Signer {
         let kept = self.funding.set_channel(&forward, &peer, &funding_txid).err().map(|e| e.msg);
         self.engine.audit.append(json!({"type": "channel_open", "peer": peer, "host": host, "from": forward, "sats": rec["sats"], "txid": funding_txid,
                                         "ts": ts_value(self.now())}));
-        let mut out = json!({"ok": true, "peer": peer, "funding_txid": funding_txid, "from": forward, "sats": rec["sats"]});
+        let mut out = json!({"ok": true, "peer": peer, "reached_at": reached, "funding_txid": funding_txid, "from": forward, "sats": rec["sats"]});
         if let Some(e) = kept {
             out["record_error"] = trunc(&e, 200).into();
         }

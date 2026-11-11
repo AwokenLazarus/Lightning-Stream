@@ -560,8 +560,10 @@ pub(crate) fn suggested_seller_ok(s: &str) -> bool {
 pub fn funding_peer(v: &str) -> Option<(String, String)> {
     let (pk, host) = v.trim().split_once('@')?;
     let pk = pk.to_ascii_lowercase();
-    let ok_host = host.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0))
+    // one address, or a few with commas between (tried in order)
+    let one = |host: &str| host.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0))
         && host.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'[' | b']' | b':'));
+    let ok_host = host.split(',').count() <= 3 && host.split(',').all(one);
     (pk.len() == 66 && pk.bytes().all(|c| c.is_ascii_hexdigit()) && ok_host).then(|| (pk, host.to_string()))
 }
 

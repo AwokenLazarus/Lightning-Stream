@@ -6558,4 +6558,7 @@ fn the_suggested_node_on_mainnet_is_one_the_signer_takes() {
     assert!(xbt_signer::ln_open::valid_pubkey(GENESIS_NODE));
     assert!(xbt_signer::ln_open::valid_host(GENESIS_HOST) && xbt_signer::ln_open::valid_host(GENESIS_ONION));
     assert!(xbt_wallet_ui::config::funding_peer(&format!("{GENESIS_NODE}@{GENESIS_ONION}")).is_some());
+    // both, as the page fills them in: tried in order on one approval
+    assert_eq!(xbt_signer::ln_open::hosts(&format!("{GENESIS_HOST},{GENESIS_ONION}")).map(|h| h.len()), Some(2));
+    assert!(xbt_wallet_ui::config::funding_peer(&format!("{GENESIS_NODE}@{GENESIS_HOST},{GENESIS_ONION}")).is_some());
 }

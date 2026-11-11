@@ -193,6 +193,14 @@ impl FundingLog {
     }
 }
 
+/// The addresses a peer is tried at, in order: `host` as one address, or up to [`MAX_HOSTS`] separated by commas (a
+/// node's public address, then its onion one). `None` when any of them is not an address.
+pub fn hosts(host: &str) -> Option<Vec<&str>> {
+    let v: Vec<&str> = host.split(',').map(str::trim).collect();
+    (!v.is_empty() && v.len() <= MAX_HOSTS && v.iter().all(|h| valid_host(h))).then_some(v)
+}
+pub const MAX_HOSTS: usize = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +226,15 @@ mod tests {
         for bad in ["node.example", "node.example:0", "node.example:99999", "user@node.example:9735", "node.example:9735/x", "a b:9735", ":9735"] {
             assert!(!valid_host(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_peer_may_have_a_few_addresses_tried_in_order() {
+        assert_eq!(hosts("203.0.113.7:9735"), Some(vec!["203.0.113.7:9735"]));
+        assert_eq!(hosts("203.0.113.7:9735, abc.onion:9735"), Some(vec!["203.0.113.7:9735", "abc.onion:9735"]));
+        assert_eq!(hosts("203.0.113.7:9735,nope"), None);
+        assert_eq!(hosts(""), None);
+        assert_eq!(hosts("a:1,b:1,c:1,d:1"), None, "no more than a few");
     }
 
     #[test]
