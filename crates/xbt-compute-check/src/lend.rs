@@ -391,7 +391,7 @@ pub fn matches(path: &Path, want: &Fetch) -> Result<bool, String> {
     }
     // noted only for a file that did not change while it was read
     let checked = Checked::of(&before, &want.sha256);
-    if std::fs::metadata(path).is_ok_and(|after| Checked::of(&after, &want.sha256) == checked) {
+    if settled(&checked) && std::fs::metadata(path).is_ok_and(|after| Checked::of(&after, &want.sha256) == checked) {
         keep_note(&note, &checked);
     }
     Ok(true)
@@ -424,6 +424,17 @@ fn checked_path(path: &Path) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".checked");
     name.into()
+}
+
+/// How long a file must have stood unchanged before a note is kept of it. File times are as coarse as the
+/// filesystem's clock tick (or a second or two, on some), so a file rewritten at its size in the tick it was
+/// noted in would still match its note. Left alone this long, no later write can share its tick.
+const NOTE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Whether the file's change time is old enough for a note of it to be told from a later write.
+fn settled(c: &Checked) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
+    now - c.ctime_ns.max(c.mtime_ns) >= NOTE_SETTLE.as_nanos() as i128
 }
 
 /// A note that cannot be written (a model of the lender's own, in a directory it cannot write) only means
@@ -483,7 +494,10 @@ pub fn fetch_checked(want: &Fetch, to: &Path) -> Result<bool, String> {
     out.sync_all().map_err(say)?;
     std::fs::rename(&part, to).map_err(say)?;
     if let Ok(m) = std::fs::metadata(to) {
-        keep_note(&checked_path(to), &Checked::of(&m, &want.sha256));
+        let c = Checked::of(&m, &want.sha256);
+        if settled(&c) {
+            keep_note(&checked_path(to), &c);
+        }
     }
     Ok(true)
 }
@@ -941,25 +955,33 @@ mod tests {
 
     #[test]
     fn a_file_checked_once_is_not_read_again_until_it_changes() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("lend-checked-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (src, to, note) = (dir.join("source"), dir.join("model.gguf"), dir.join("model.gguf.checked"));
         std::fs::write(&src, b"the real file").unwrap();
         let good = Fetch { url: src.display().to_string(), sha256: hex::encode(Sha256::digest(b"the real file")), bytes: 13 };
         assert!(fetch_checked(&good, &to).unwrap());
-        assert!(note.exists(), "noted as it was fetched");
-        // with the note the file is not read: one nobody may read still checks
-        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(matches(&to, &good).unwrap(), "the note answers");
-        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // changed in place, at its size: read again, and found out
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&to, b"the fake file").unwrap();
+        // too new to tell from a later write in the same clock tick: no note yet, and the next look reads it
+        assert!(!note.exists(), "a file this new is not noted");
+        std::thread::sleep(NOTE_SETTLE + Duration::from_millis(100));
+        assert!(matches(&to, &good).unwrap());
+        assert!(note.exists(), "noted once it has stood");
+        // with the note the file is not read: a note made to say the same of another file of its size is believed
+        std::fs::write(&src, b"the fake file").unwrap();
+        std::fs::rename(&src, &to).unwrap();
+        let m = std::fs::metadata(&to).unwrap();
+        keep_note(&note, &Checked::of(&m, &good.sha256));
+        assert!(matches(&to, &good).unwrap(), "the note answers without a read");
+        // changed in place, at its size: its change time moves, so it is read again, and found out
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&to, b"the fake FILE").unwrap();
         assert!(!matches(&to, &good).unwrap());
         assert!(!note.exists(), "the note of a file that no longer matches is dropped");
-        // put right, it is read once and noted again
+        // put right, it is read; noted only after it has stood
         std::fs::write(&to, b"the real file").unwrap();
+        assert!(matches(&to, &good).unwrap());
+        assert!(!note.exists());
+        std::thread::sleep(NOTE_SETTLE + Duration::from_millis(100));
         assert!(matches(&to, &good).unwrap());
         assert!(note.exists());
         // a note says what the file was found to be, and answers for no other hash
