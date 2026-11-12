@@ -837,8 +837,7 @@ mod tests {
             log.lock().unwrap().push(w.drafted);
             Ok(())
         });
-        let mut w = Watch::default();
-        w.drafted = 1;
+        let mut w = Watch { drafted: 1, ..Watch::default() };
         writer.save(&w).unwrap();
         started.recv_timeout(Duration::from_secs(5)).expect("the writer took the first snapshot");
         // the disk is stuck inside the first write: the loop still saves, and reads and decides on
