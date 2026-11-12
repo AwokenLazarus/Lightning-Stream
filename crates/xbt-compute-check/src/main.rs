@@ -283,7 +283,7 @@ fn read_count(console: &str, me: &str, watch: &mut xbt_compute_check::lend::Watc
 }
 
 fn lend(flags: &Flags) -> Result<(), String> {
-    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_offers, load_watch, matches, may_rejoin, mesh_args, node_id_of_token, offer_note, offers_after, save_offers, save_watch, terms_text, Action, Card, Invite, SavedOffer, Stop, REJOIN_WAIT_S};
+    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_offers, load_watch, matches, may_rejoin, mesh_args, node_id_of_token, offer_note, offers_after, save_offers, terms_text, Action, Card, Invite, SavedOffer, Stop, WatchWriter, REJOIN_WAIT_S};
     use xbt_compute_check::meter::Work;
     use xbt_compute_check::payout::http_json;
     use xbt_gateway::node::{InvoiceState, LndRest, Node};
@@ -394,6 +394,8 @@ fn lend(flags: &Flags) -> Result<(), String> {
     mesh.take_up();
     let watch_path = dir.join("watch.json");
     let mut watch = load_watch(&watch_path)?;
+    // the disk may stall: the loop hands its watch over and goes on, and never waits for it to be on disk
+    let writer = WatchWriter::start(watch_path.clone());
     // drafting seen before this start was answered by the lender starting again
     let drafted_before = watch.drafted;
     let credit = credit_sats.saturating_mul(1000);
@@ -469,7 +471,7 @@ fn lend(flags: &Flags) -> Result<(), String> {
                 Action::Serve | Action::StayStopped => {}
             }
         }
-        save_watch(&watch_path, &watch)?;
+        writer.save(&watch)?;
         let shares: serde_json::Map<String, serde_json::Value> = watch.tokens.keys().filter_map(|k| {
             let (a, b) = k.split_once('-')?;
             let active = work.stage(a.parse().ok()?, b.parse().ok()?);
@@ -506,7 +508,8 @@ fn lend(flags: &Flags) -> Result<(), String> {
             let _ = read_count(&console, id, &mut watch);
         }
     });
-    save_watch(&watch_path, &watch)
+    writer.save(&watch)?;
+    writer.finish()
 }
 
 fn free_bytes(dir: &std::path::Path) -> Result<u64, String> {

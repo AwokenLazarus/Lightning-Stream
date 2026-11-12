@@ -498,6 +498,78 @@ pub fn save_watch(path: &Path, w: &Watch) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(say)
 }
 
+/// Keeps the watch on disk without the watch loop waiting for the disk: `save` hands over a snapshot and returns,
+/// a thread of its own writes it (temp file, fsync, rename), and a snapshot not yet written when a newer one
+/// comes is dropped, so a stalled disk holds at most one. A failed write is reported by the next `save`.
+pub struct WatchWriter {
+    slot: std::sync::Arc<(std::sync::Mutex<WriterSlot>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct WriterSlot {
+    next: Option<Watch>,
+    err: Option<String>,
+    closed: bool,
+}
+
+impl WatchWriter {
+    pub fn start(path: std::path::PathBuf) -> Self {
+        Self::with(move |w| save_watch(&path, w))
+    }
+
+    /// A writer that persists with `write`: the tests give it a slow one.
+    pub fn with(mut write: impl FnMut(&Watch) -> Result<(), String> + Send + 'static) -> Self {
+        let slot = std::sync::Arc::new((std::sync::Mutex::new(WriterSlot::default()), std::sync::Condvar::new()));
+        let mine = slot.clone();
+        let thread = std::thread::spawn(move || loop {
+            let w = {
+                let mut s = mine.0.lock().unwrap_or_else(|e| e.into_inner());
+                while s.next.is_none() && !s.closed {
+                    s = mine.1.wait(s).unwrap_or_else(|e| e.into_inner());
+                }
+                match s.next.take() {
+                    Some(w) => w,
+                    None => return,
+                }
+            };
+            let r = write(&w);
+            mine.0.lock().unwrap_or_else(|e| e.into_inner()).err = r.err();
+        });
+        WatchWriter { slot, thread: Some(thread) }
+    }
+
+    /// Hands over the latest watch and returns at once, with the error of the last write that failed.
+    pub fn save(&self, w: &Watch) -> Result<(), String> {
+        let mut s = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        s.next = Some(w.clone());
+        let err = s.err.take();
+        drop(s);
+        self.slot.1.notify_one();
+        err.map_or(Ok(()), Err)
+    }
+
+    /// Waits for the last snapshot to be on disk: for the end, once the loop has no decision left to make.
+    pub fn finish(mut self) -> Result<(), String> {
+        self.close();
+        self.slot.0.lock().unwrap_or_else(|e| e.into_inner()).err.take().map_or(Ok(()), Err)
+    }
+
+    fn close(&mut self) {
+        self.slot.0.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.slot.1.notify_one();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for WatchWriter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 pub fn load_watch(path: &Path) -> Result<Watch, String> {
     match std::fs::read(path) {
         Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
@@ -748,6 +820,54 @@ mod tests {
         assert_eq!(w.total_tokens(), 35);
         assert_eq!(w.tokens["0-2"], 29);
         assert_eq!(w.tokens["2-4"], 6);
+    }
+
+    /// The watch loop never waits for the disk: while a write is stalled, saves return, newer ones replace
+    /// older ones, and once the disk answers the latest is what is written.
+    #[test]
+    fn a_stalled_write_does_not_hold_the_watch_up() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let (release, gate) = mpsc::channel::<()>();
+        let (started_tx, started) = mpsc::channel::<()>();
+        let written: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let log = written.clone();
+        let writer = WatchWriter::with(move |w| {
+            let _ = started_tx.send(());
+            gate.recv().ok();
+            log.lock().unwrap().push(w.drafted);
+            Ok(())
+        });
+        let mut w = Watch::default();
+        w.drafted = 1;
+        writer.save(&w).unwrap();
+        started.recv_timeout(Duration::from_secs(5)).expect("the writer took the first snapshot");
+        // the disk is stuck inside the first write: the loop still saves, and reads and decides on
+        let t = std::time::Instant::now();
+        for n in 2..=1000 {
+            w.drafted = n;
+            writer.save(&w).unwrap();
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "saves waited for the stalled write");
+        assert!(written.lock().unwrap().is_empty(), "the write is still stalled");
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(*written.lock().unwrap(), vec![1, 1000], "one stalled, then only the latest: nothing queued up");
+    }
+
+    #[test]
+    fn a_failed_write_is_told_by_the_next_save() {
+        let writer = WatchWriter::with(|_| Err("disk full".to_string()));
+        writer.save(&Watch::default()).unwrap();
+        let mut told = None;
+        for _ in 0..500 {
+            if let Err(e) = writer.save(&Watch::default()) {
+                told = Some(e);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(told.as_deref(), Some("disk full"));
     }
 
     /// V-2: the share is the meter's, the same the operator's ledger pays by.
