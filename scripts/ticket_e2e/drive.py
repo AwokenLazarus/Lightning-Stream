@@ -4001,8 +4001,10 @@ ABANDONED_ANSWERS = int(os.environ.get("LEND_REAL_ABANDONED", "0"))
 # the next joins, or all before the operator's one restart: a model too big for fewer machines than its plan has can only be served so
 LEND_REAL_LENDERS = int(os.environ.get("LEND_REAL_LENDERS", "1"))
 LEND_REAL_TOGETHER = os.environ.get("LEND_REAL_TOGETHER") == "1"
-# what each Mesh-LLM may hold, in GB: each lender's, through the invite, and the operator's, one more
+# what each Mesh-LLM may hold, in GB: each lender's, through the invite
 LEND_REAL_VRAM = int(os.environ.get("LEND_REAL_VRAM", "4"))
+# the operator's alone: by default one more than a lender's; less, for an operator on a small machine whose own stage is the shortest
+LEND_REAL_OP_VRAM = int(os.environ.get("LEND_REAL_OP_VRAM", str(LEND_REAL_VRAM + 1)))
 LEND_REAL_ANSWERS = int(os.environ.get("LEND_REAL_ANSWERS", "36"))
 # The coordinator's settings go to each stage in its load, whatever the lender's own say. With LEND_REAL_NO_MMAP=1 every stage reads
 # its weights into memory as it loads instead of mapping them from disk (Mesh-LLM's `[defaults.hardware] mmap`): to compare the two
@@ -4094,7 +4096,7 @@ def mesh_lend_real() -> None:
             PROCS["op-mesh"].terminate()
             PROCS["op-mesh"].wait(40)
         args = ["--log-format", "json", "serve", "--gguf", MESH_GGUF, "--split", "--headless", "--llama-flavor", "cpu", "--bind-ip", LEND_REAL_BIND, "--bind-port", str(OP_QUIC), "--port", str(OP_API),
-                "--console", str(OP_CONSOLE), "--no-draft", "--parallel", "1", "--ctx-size", "2048", "--kv-cache-disk", "off", "--disable-iroh-relays", "--max-vram", str(LEND_REAL_VRAM + 1)]
+                "--console", str(OP_CONSOLE), "--no-draft", "--parallel", "1", "--ctx-size", "2048", "--kv-cache-disk", "off", "--disable-iroh-relays", "--max-vram", str(LEND_REAL_OP_VRAM)]
         if lock:
             args += ["--split-topology-lock", lock]
         with open(f"{RUN}/op-mesh.log", "ab") as log:
