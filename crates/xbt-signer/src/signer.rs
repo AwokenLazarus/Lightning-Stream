@@ -966,6 +966,10 @@ impl Signer {
         let Some(node) = &self.ln_open else {
             return json!({"ok": false, "reason": self.ln_open_error.clone().unwrap_or_else(|| "the app has no key to open channels with".into()), "open_key": false});
         };
+        // one address until a deposit has gone to it: looking at the page again asks the node for nothing
+        if let Some(addr) = self.funding.unused_address().filter(|a| address_to_spk(a, &self.hrp).is_ok()) {
+            return json!({"ok": true, "address": addr});
+        }
         let addr = match node.new_address() {
             Ok(a) => a,
             Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),

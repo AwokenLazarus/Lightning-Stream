@@ -169,6 +169,14 @@ impl FundingLog {
         self.read()["addresses"].as_array().is_some_and(|a| a.iter().any(|x| x.as_str() == Some(address)))
     }
 
+    /// The newest address the node gave that no forwarded deposit has paid yet: asked for once, shown until used.
+    pub fn unused_address(&self) -> Option<String> {
+        let v = self.read();
+        let last = v["addresses"].as_array()?.last()?.as_str()?.to_string();
+        let used = v["forwards"].as_array().is_some_and(|f| f.iter().any(|x| x["to"].as_str() == Some(last.as_str())));
+        (!used).then_some(last)
+    }
+
     pub fn add_forward(&self, txid: &str, to: &str, sats: i64, ts: i64) -> Result<()> {
         self.push("forwards", json!({"txid": txid, "to": to, "sats": sats, "ts": ts}))
     }
@@ -204,6 +212,23 @@ pub const MAX_HOSTS: usize = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Add money page is looked at many times before a deposit is moved: the node is asked for one
+    /// address, and for a new one only after a deposit has gone to it.
+    ///
+    /// FAILS when every look asks the node: its wallet fills with addresses nothing was sent to.
+    #[test]
+    fn the_nodes_address_is_kept_until_a_deposit_has_gone_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = FundingLog::open(&dir.path().join(LOG_FILE));
+        assert_eq!(log.unused_address(), None, "none asked for yet");
+        log.add_address("addr1").unwrap();
+        assert_eq!(log.unused_address().as_deref(), Some("addr1"));
+        log.add_forward("aa", "addr1", 249_400, 1).unwrap();
+        assert_eq!(log.unused_address(), None, "a deposit went there");
+        log.add_address("addr2").unwrap();
+        assert_eq!(log.unused_address().as_deref(), Some("addr2"));
+    }
 
     #[test]
     fn an_open_key_has_what_opening_needs_and_on_mainnet_nothing_more() {
