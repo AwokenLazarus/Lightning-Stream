@@ -696,10 +696,15 @@ pub(crate) fn write_settings(path: &std::path::Path, v: &Value) -> Result<(), St
 impl App {
     /// For Home: the hashmaker's state in a pill and a sentence, the same words as Sell → Hashrate's
     /// own status; None when this box doesn't rent out miners.
-    pub(crate) fn hashrate_summary(&self) -> Option<(&'static str, String, String)> {
+    /// With it, whether renting is turned on (as saved, or as the hashmaker last read it): a box whose miners are
+    /// for rent is a box that sells, whoever rents them or nobody yet.
+    pub(crate) fn hashrate_summary_on(&self) -> Option<(bool, (&'static str, String, String))> {
         let base = self.cfg.hash.hasher.as_ref()?;
         let st = call(base, &self.cfg.hash.hasher_token, "GET", "/status", None);
-        Some(renting_state(&st, &self.hash_settings()))
+        let saved = self.hash_settings();
+        let on = saved.get("enabled").filter(|v| !v.is_null()).or_else(|| st.as_ref().ok().and_then(|s| s["settings"].get("enabled")))
+            == Some(&Value::Bool(true));
+        Some((on, renting_state(&st, &saved)))
     }
 
     pub(crate) fn hash_settings(&self) -> Value {

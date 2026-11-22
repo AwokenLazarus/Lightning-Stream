@@ -1149,7 +1149,10 @@ impl App {
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let (ready, connected, _) = self.node_state();
         let ack = connected && self.ack_needed();
-        b.push_str(&self.get_started(ctx, human, connected, ack));
+        // the hashmaker is asked once: what it says is both the Sell card's words and whether this box sells
+        let (renting_on, renting) = self.hashrate_summary_on().map_or((false, None), |(on, s)| (on, Some(s)));
+        let sells = self.sells(renting_on);
+        b.push_str(&self.get_started(ctx, human, connected, ack, sells));
         let services = self.file_services().unwrap_or_default();
         let sellers = {
             let mut o: Vec<String> = services.iter().filter_map(|s| crate::services::http_origin(&s.seller)).collect();
@@ -1168,7 +1171,6 @@ impl App {
             if human && ready { " primary" } else { "" }));
         // what this box sells: its shop's services, and its miners when it rents them out. A box that only rents
         // out miners said "Not selling yet" here while its offer was listed (issue #75), so each is said by itself
-        let renting = self.hashrate_summary();
         if self.cfg.sell || renting.is_some() {
             let mut rows = String::new();
             // a shop with nothing in it is not news beside miners that are rented out
@@ -1206,14 +1208,14 @@ impl App {
     }
 
     /// Whether this box is set up to sell something: its miners are for rent, or its shop has a service.
-    fn sells(&self) -> bool {
-        (self.cfg.hash.hasher.is_some() && self.hash_settings()["enabled"] == true) || (self.cfg.sell && !self.shop().offers.is_empty())
+    fn sells(&self, renting_on: bool) -> bool {
+        renting_on || (self.cfg.sell && !self.shop().offers.is_empty())
     }
 
     /// Home's "First steps" list, until every step is done: the approval key, the node, the starter
     /// rules (with, on mainnet, the yes to paying with real money ticked as they are signed), a shop allowed (the demo shop in one press where the box
     /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
-    fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
+    fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool, sells: bool) -> String {
         let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
         let paying = paying_on(&pol);
         // allowed as the signer decides: also a shop allowed only through its node's `ln:` line
@@ -1259,7 +1261,7 @@ impl App {
         let next = steps.iter().position(|s| !s.0).unwrap_or(0);
         // these steps are all for buying. On a box that sells, they are said to be so and are not the page's main
         // thing: a seller who never buys read "1 of 4 done" as the box not being ready to sell (issue #75)
-        let mut b = if self.sells() {
+        let mut b = if sells {
             format!("<section class=\"card\" id=\"get-started\"><h2>First steps to buy</h2><p class=\"small\">{done} of {} done. \
                      These are for buying from others. Selling does not need them.</p><ol class=\"checklist\">", steps.len())
         } else {
