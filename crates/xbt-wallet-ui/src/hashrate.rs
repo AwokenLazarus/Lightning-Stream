@@ -449,16 +449,18 @@ fn sats_n(n: f64) -> String {
 /// The checklist's line on being paid: how much the node can receive, and when that is nothing, or less than
 /// one piece of work of this offer costs (`price`, when known), why and what to do, in plain words. A seller
 /// cannot be paid without room on the other side of a channel, and this took sellers the most help to sort out.
-fn receive_words(receivable: Option<i64>, price: Option<u64>) -> String {
+pub(crate) fn receive_words(receivable: Option<i64>, price: Option<u64>, payer: &str) -> String {
+    // who pays: "hashtaker" on the Hashrate page, "buyer" in the shop
+    let payers = format!("{}{}s", payer[..1].to_uppercase(), &payer[1..]);
     const MAKE_ROOM: &str = "To make room, ask another node to open a channel to you, or open a channel yourself and spend some of it. \
                              What you spend moves to the other side, and that much can then come back to you.";
     match receivable {
         None => "The app cannot see your channels yet. Connect your node on Your node to see how much you can receive.".into(),
-        Some(0) => format!("Can receive about 0 sats. Hashtakers pay you through your channels, and none of them has room for a payment to come in. {MAKE_ROOM}"),
+        Some(0) => format!("Can receive about 0 sats. {payers} pay you through your channels, and none of them has room for a payment to come in. {MAKE_ROOM}"),
         // a hashtaker pays in tickets, none smaller than `price` here (the smallest ticket of this offer): room
         // for less is room for no payment at all
         Some(n) => match price.filter(|p| (n as u64) < *p) {
-            Some(p) => format!("Can receive about {}, less than a hashtaker's smallest payment ({}). {MAKE_ROOM}", sats_n(n as f64), sats_n(p as f64)),
+            Some(p) => format!("Can receive about {}, less than a {payer}'s smallest payment ({}). {MAKE_ROOM}", sats_n(n as f64), sats_n(p as f64)),
             None => format!("Can receive about {}.", sats_n(n as f64)),
         },
     }
@@ -1068,7 +1070,7 @@ impl App {
             (connected, "Your Lightning node is connected",
              if connected { "Hashtakers pay you through it.".into() } else { "Hashtakers pay you through your Lightning node. Connect it on Sell.".into() },
              "./sell", "Connect it"),
-            (can_receive(receivable, least), "You can receive payments", receive_words(receivable, least), "./lightning", "Your node and channels"),
+            (can_receive(receivable, least), "You can receive payments", receive_words(receivable, least, "hashtaker"), "./lightning", "Your node and channels"),
             (!fallback.is_empty() && live > 0, "Your miners are connected",
              if fallback.is_empty() {
                  "Say where your miners hash when nobody rents them, in the form below.".into()
@@ -2222,7 +2224,7 @@ fn pct(x: f64) -> String {
 /// What a rental may take from the wallet beyond its budget, as the hashtaker answered it: a ticket
 /// bought whole, its unused part staying with that seller as credit.
 /// The smallest ticket a shop sells (`xbt_hashlink::order::FIRST_STEP_MSAT`, the dust limit), in sats.
-const SMALLEST_TICKET_SAT: u64 = 546;
+pub(crate) const SMALLEST_TICKET_SAT: u64 = 546;
 
 /// The smallest ticket a rental pays with: the shop's smallest, never under one piece of work.
 fn smallest_ticket_sat(price_sat: f64) -> u64 {
@@ -2447,6 +2449,17 @@ pub(crate) fn renting_state(st: &Result<Value, String>, saved: &Value) -> (&'sta
 
 #[cfg(test)]
 mod tests {
+    /// The words on being paid name who pays: a hashtaker on the Hashrate page, a buyer in the shop.
+    #[test]
+    fn the_words_on_being_paid_name_who_pays() {
+        let shop = receive_words(Some(0), Some(SMALLEST_TICKET_SAT), "buyer");
+        assert!(shop.starts_with("Can receive about 0 sats. Buyers pay you through your channels") && shop.contains("ask another node to open a channel to you"), "{shop}");
+        let low = receive_words(Some(30), Some(SMALLEST_TICKET_SAT), "buyer");
+        assert!(low.contains("less than a buyer's smallest payment (546 sats)"), "{low}");
+        assert!(receive_words(Some(0), None, "hashtaker").contains("Hashtakers pay you"));
+        assert_eq!(receive_words(Some(59_000), Some(SMALLEST_TICKET_SAT), "buyer"), "Can receive about 59,000 sats.");
+    }
+
     /// An offer names its seller by the shop's listed name; its address only where no listing names it.
     #[test]
     fn an_offer_is_sold_by_the_shop_s_name() {

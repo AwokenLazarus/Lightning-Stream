@@ -1429,6 +1429,16 @@ impl App {
         if let Some((_, e)) = &sent {
             b.push_str(&App::error_box(e));
         }
+        // a shop with something to sell and no room to be paid: said here, before a buyer's payment fails. Only
+        // when the room is known (the wallet's own view of the node's channels); unknown is not a warning
+        if self.keys_stored() && !shop.offers.is_empty() {
+            let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+            let least = super::hashrate::SMALLEST_TICKET_SAT;
+            if let Some(n) = crate::pay_feedback::receivable_sats(&ln).filter(|n| (*n as u64) < least) {
+                b.push_str(&format!("<div class=\"flash warn\"><strong>Buyers can't pay you yet.</strong> {} <a href=\"./lightning\">Your node and channels</a></div>",
+                                    esc(&super::hashrate::receive_words(Some(n), Some(least), "buyer"))));
+            }
+        }
 
         // step 1: the node, once
         let keys = self.keys_stored();
