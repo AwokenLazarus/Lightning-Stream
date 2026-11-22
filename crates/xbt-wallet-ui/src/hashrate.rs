@@ -806,6 +806,8 @@ impl App {
         let (class, head, next) = renting_state(&st, &saved);
         b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{}</p>{}</section>",
                             esc(&head), if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
+        // the checklist counts the miners that are connected, as the status above does
+        let live = miners.iter().filter(|m| m["connected"] == true).count();
         b.push_str(&self.rent_checklist(&st, on, &fallback, live));
 
         // where the miners point, once
