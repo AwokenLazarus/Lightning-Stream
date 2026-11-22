@@ -3350,25 +3350,28 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
 struct ChannelsLn(std::sync::Mutex<Vec<Value>>);
 impl xbt_signer::ln::LnBackend for ChannelsLn {
     fn get_info(&self) -> xbt402::Result<Value> {
-        Err(xbt402::ChannelError::new("ln_backend", "not in this test".into()))
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
     }
     fn block_hash(&self, _: i64) -> xbt402::Result<String> {
-        Err(xbt402::ChannelError::new("ln_backend", "not in this test".into()))
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
     }
     fn decode(&self, _: &str) -> xbt402::Result<Value> {
-        Err(xbt402::ChannelError::new("ln_backend", "not in this test".into()))
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
     }
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
         Ok(self.0.lock().unwrap().clone())
     }
     fn send(&self, _: &xbt_signer::ln::SendRequest) -> xbt402::Result<Value> {
-        Err(xbt402::ChannelError::new("ln_backend", "not in this test".into()))
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
     }
     fn lookup(&self, _: &str) -> xbt402::Result<Option<Value>> {
-        Err(xbt402::ChannelError::new("ln_backend", "not in this test".into()))
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
     }
     fn utxos(&self) -> xbt402::Result<Vec<Value>> {
         Ok(vec![])
+    }
+    fn describe(&self) -> String {
+        "in-memory node".into()
     }
 }
 
