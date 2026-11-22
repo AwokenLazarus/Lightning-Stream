@@ -3116,6 +3116,11 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Home says the same of the miners as this page: a box that only rents them out is selling (issue #75)
     let home = br.get("/").body;
     assert!(home.contains("Renting out: 1 of 2 miners rented") && home.contains("href=\"./sell-hashrate\""), "Home leaves the rented miners out: {home}");
+    // and the steps for buying are not the seller's to do: where Home lists them, it says they are for buying
+    assert!(!home.contains("<h2>First steps</h2>"), "a box that sells is told its buying steps are first steps: {home}");
+    if home.contains("id=\"get-started\"") {
+        assert!(home.contains("<h2>First steps to buy</h2>") && home.contains("Selling does not need them."), "{home}");
+    }
     assert!(br.get("/browse").body.contains("href=\"./hashrate\""), "and of Services");
     plain("/sell-hashrate", &p.body);
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "stop"), ("rental", "r1")]);

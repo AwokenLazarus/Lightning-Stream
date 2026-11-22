@@ -1205,6 +1205,11 @@ impl App {
         self.page("Home", ctx, b)
     }
 
+    /// Whether this box is set up to sell something: its miners are for rent, or its shop has a service.
+    fn sells(&self) -> bool {
+        (self.cfg.hash.hasher.is_some() && self.hash_settings()["enabled"] == true) || (self.cfg.sell && !self.shop().offers.is_empty())
+    }
+
     /// Home's "First steps" list, until every step is done: the approval key, the node, the starter
     /// rules (with, on mainnet, the yes to paying with real money ticked as they are signed), a shop allowed (the demo shop in one press where the box
     /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
@@ -1252,8 +1257,15 @@ impl App {
             return String::new();
         }
         let next = steps.iter().position(|s| !s.0).unwrap_or(0);
-        let mut b = format!("<section class=\"card primary\" id=\"get-started\"><h2>First steps</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
-                            steps.len());
+        // these steps are all for buying. On a box that sells, they are said to be so and are not the page's main
+        // thing: a seller who never buys read "1 of 4 done" as the box not being ready to sell (issue #75)
+        let mut b = if self.sells() {
+            format!("<section class=\"card\" id=\"get-started\"><h2>First steps to buy</h2><p class=\"small\">{done} of {} done. \
+                     These are for buying from others. Selling does not need them.</p><ol class=\"checklist\">", steps.len())
+        } else {
+            format!("<section class=\"card primary\" id=\"get-started\"><h2>First steps</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+                    steps.len())
+        };
         for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
             let action = if i != next {
                 String::new()
