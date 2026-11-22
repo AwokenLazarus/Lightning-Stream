@@ -446,18 +446,91 @@ fn sats_n(n: f64) -> String {
     format!("{o} {}", if n == 1 { "sat" } else { "sats" })
 }
 
-/// The checklist's line on being paid: how much the node can receive, and when that is nothing, why and
-/// what to do, in plain words. A seller cannot be paid without room on the other side of a channel, and
-/// this took sellers the most help to sort out.
-fn receive_words(receivable: Option<i64>) -> String {
+/// The checklist's line on being paid: how much the node can receive, and when that is nothing, or less than
+/// one piece of work of this offer costs (`price`, when known), why and what to do, in plain words. A seller
+/// cannot be paid without room on the other side of a channel, and this took sellers the most help to sort out.
+fn receive_words(receivable: Option<i64>, price: Option<u64>) -> String {
+    const MAKE_ROOM: &str = "To make room, ask another node to open a channel to you, or open a channel yourself and spend some of it. \
+                             What you spend moves to the other side, and that much can then come back to you.";
     match receivable {
         None => "The app cannot see your channels yet. Connect your node on Your node to see how much you can receive.".into(),
-        Some(0) => "Can receive about 0 sats. Hashtakers pay you through your channels, and none of them has room for a payment to come in. \
-                    To make room, ask another node to open a channel to you, or open a channel yourself and spend some of it. \
-                    What you spend moves to the other side, and that much can then come back to you.".into(),
-        Some(n) => format!("Can receive about {}.", sats_n(n as f64)),
+        Some(0) => format!("Can receive about 0 sats. Hashtakers pay you through your channels, and none of them has room for a payment to come in. {MAKE_ROOM}"),
+        // a hashtaker pays a piece at a time: room for less than one piece is room for no payment of this offer
+        Some(n) => match price.filter(|p| (n as u64) < *p) {
+            Some(p) => format!("Can receive about {}, less than one piece of work costs ({}). {MAKE_ROOM}", sats_n(n as f64), sats_n(p as f64)),
+            None => format!("Can receive about {}.", sats_n(n as f64)),
+        },
     }
 }
+
+/// Whether the node can be paid for this offer: room for one piece of work when its price is known, for anything otherwise.
+fn can_receive(receivable: Option<i64>, price: Option<u64>) -> bool {
+    receivable.is_some_and(|r| r > 0 && price.is_none_or(|p| r as u64 >= p))
+}
+
+/// The price of one piece of work of this offer, in sats, when it is known: what the hashmaker charges now (its status's
+/// settings, market or fixed), or, when the hashmaker can't be asked, a fixed price's piece as saved for it. `None`
+/// otherwise: a market price moves, and only the hashmaker's word on it is taken.
+fn piece_price(st: &Result<Value, String>, saved: &Value) -> Option<u64> {
+    let charged = st.as_ref().ok().and_then(|s| s["settings"]["priceSat"].as_u64()).filter(|p| *p > 0);
+    charged.or_else(|| match pricing(saved) {
+        Pricing::Fixed { .. } => saved["priceSat"].as_u64().filter(|p| *p > 0),
+        Pricing::Market(_) => None,
+    })
+}
+
+/// The first rental that paid, from the hashmaker's status: the earliest of the rentals going on and those that ended
+/// with at least one piece of work paid. What it delivered, as the hashmaker's own count: the pieces paid, the sats
+/// earned and the shares its own hash check proved; and whether it has ended.
+fn first_paid(st: &Value) -> Option<Value> {
+    let going = st["rentals"].as_array().into_iter().flatten().map(|r| (r, false));
+    let ended = st["finished"].as_array().into_iter().flatten().map(|r| (r, true));
+    going.chain(ended)
+        .filter(|(r, _)| r["paid"].as_u64().unwrap_or(0) > 0)
+        .min_by_key(|(r, _)| r["startedMs"].as_u64().unwrap_or(u64::MAX))
+        .map(|(r, ended)| json!({"rental": r["rental"], "startedMs": r["startedMs"], "paid": r["paid"], "earnedMsat": r["earnedMsat"],
+                                 "shares": r["meter"]["proven"].as_u64().unwrap_or(0), "ended": ended || !r["stopped"].is_null()}))
+}
+
+/// The same rental in two records: its name and its start (a name alone could come again after a restart).
+fn same_rental(a: &Value, b: &Value) -> bool {
+    a["rental"] == b["rental"] && a["startedMs"] == b["startedMs"]
+}
+
+/// Of a status's list of rentals, the one that is `r`, if it is there.
+fn same_only(list: &Value, r: &Value) -> Value {
+    Value::Array(list.as_array().into_iter().flatten().filter(|x| same_rental(x, r)).cloned().collect())
+}
+
+/// The checklist's last line, once a rental has paid: what it delivered and earned, and where the miners are now.
+/// Said only from the hashmaker's own records; that the miners are home is said only when that rental has ended and
+/// the hashmaker shows no miner rented.
+fn first_paid_words(first: &Value, st: &Result<Value, String>) -> String {
+    let paid = first["paid"].as_u64().unwrap_or(0);
+    let shares = first["shares"].as_u64().unwrap_or(0);
+    let mut w = format!("Your first rental: {paid} piece{} of work paid, {} earned", if paid == 1 { "" } else { "s" }, sats_n(num(&first["earnedMsat"]) / 1000.0));
+    if shares > 0 {
+        w.push_str(&format!(", {shares} share{} checked by your node", if shares == 1 { "" } else { "s" }));
+    }
+    w.push('.');
+    if let Ok(s) = st {
+        let miners = s["miners"].as_array().cloned().unwrap_or_default();
+        let home = miners.iter().any(|m| m["connected"] == true) && miners.iter().all(|m| m["rentedTo"].is_null());
+        let going = s["rentals"].as_array().into_iter().flatten().any(|r| same_rental(r, first));
+        if going {
+            w.push_str(" It is going on now.");
+        } else if first["ended"] == true && home {
+            w.push_str(" It has ended, and your miners are back on your own pool.");
+        }
+    }
+    w
+}
+
+/// What the last line says until a rental has paid: why the box can't test itself, and how to get a first rental.
+const NO_RENTAL_YET: &str = "Nobody has rented your miners yet. This box can't rent its own miners, because a Lightning node can't pay itself. \
+    To see it work before a stranger rents, ask another Lightning Stream user to try one piece of yours (on Rent hashrate, Try one slice first), \
+    or rent from a second box with its own Lightning node. When it happens, this line shows the work your miners delivered and the sats you were paid. \
+    When the rental ends, your miners go back to your own pool.";
 
 /// Whether a hashmaker could drop the shares that win on this upstream, as its jobs show. Nothing here names a pool:
 /// a pool that adds a key shows as blinded by itself.
@@ -952,8 +1025,10 @@ impl App {
 
     /// What renting out needs, in order, as Home's First steps shows its own: each line done or not, with
     /// its one next step, the first one left to do with its button. Sellers told us the pieces were spread
-    /// over several pages, and a box that could not be paid said so only when a rental failed. Once every
-    /// line is done it is one line, so it does not crowd a box that is renting.
+    /// over several pages, and a box that could not be paid said so only when a rental failed. The last line is
+    /// the first rental paid (#79): a box can't rent from itself, so it is done from the hashmaker's own records
+    /// when someone else's rental has delivered and paid, and until then it says how to get one. Once every line
+    /// is done it is one line, so it does not crowd a box that is renting.
     fn rent_checklist(&self, st: &Result<Value, String>, on: bool, fallback: &str, live: usize) -> String {
         let node = self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == true);
         // hashtakers pay through the shop, so its keys to the node are what make this box payable
@@ -962,6 +1037,8 @@ impl App {
         let receivable = crate::pay_feedback::receivable_sats(&ln);
         let listing = st.as_ref().ok().map(|s| s["listing"].clone()).unwrap_or(Value::Null);
         let listed = listing["ok"] == true;
+        let price = piece_price(st, &self.hash_settings());
+        let first = self.first_rental(st);
         // (done, title, the state or the one next step, where to go, its button)
         let steps: Vec<(bool, &str, String, &str, &str)> = vec![
             (node, "Your XBT node answers",
@@ -971,7 +1048,7 @@ impl App {
             (connected, "Your Lightning node is connected",
              if connected { "Hashtakers pay you through it.".into() } else { "Hashtakers pay you through your Lightning node. Connect it on Sell.".into() },
              "./sell", "Connect it"),
-            (receivable.is_some_and(|r| r > 0), "You can receive payments", receive_words(receivable), "./lightning", "Your node and channels"),
+            (can_receive(receivable, price), "You can receive payments", receive_words(receivable, price), "./lightning", "Your node and channels"),
             (!fallback.is_empty() && live > 0, "Your miners are connected",
              if fallback.is_empty() {
                  "Say where your miners hash when nobody rents them, in the form below.".into()
@@ -985,14 +1062,20 @@ impl App {
              else if !on { "Turn renting on in the form below, then save.".into() }
              else { listing["why"].as_str().unwrap_or("Your offer goes on public listings once a miner is connected.").to_string() },
              "#rent-form", "Rent out your miners"),
+            // nowhere to go from here: the first rental comes from another box
+            (first.is_some(), "A first rental has been paid",
+             first.as_ref().map(|f| first_paid_words(f, st)).unwrap_or_else(|| NO_RENTAL_YET.into()), "", ""),
         ];
         let done = steps.iter().filter(|s| s.0).count();
+        // everything but the first rental: the box can be rented, and says so above the line still to come
+        let ready = steps[..steps.len() - 1].iter().all(|s| s.0);
+        let ready_pill = "<span class=\"pill good\">Ready to be rented</span>";
         if done == steps.len() {
-            return "<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span></p>".into();
+            return format!("<p class=\"status-line\" id=\"rent-checklist\">{ready_pill} <span class=\"small\">{}</span></p>", esc(&steps[steps.len() - 1].2));
         }
         let next = steps.iter().position(|s| !s.0).unwrap_or(0);
-        let mut b = format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent out</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
-                            steps.len());
+        let mut b = format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent out</h2>{}<p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+                            if ready { format!("<p>{ready_pill}</p>") } else { String::new() }, steps.len());
         for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
             // a step with nowhere to go (the XBT node is set up outside the app) says what to check, with no button
             let action = if i == next && !href.is_empty() { format!("<p><a class=\"button-link primary\" href=\"{href}\">{}</a></p>", esc(button)) } else { String::new() };
@@ -1002,6 +1085,26 @@ impl App {
         }
         b.push_str("</ol></section>");
         b
+    }
+
+    /// The first rental that paid this box, as the hashmaker's status shows it, kept in `first-rental.json` beside the
+    /// renting settings: the hashmaker keeps its ended rentals only until it restarts, and the checklist's last line
+    /// should not go back to "nobody has rented" after an update. A kept record is the first; the status only brings
+    /// it up to date while it still shows that rental.
+    fn first_rental(&self, st: &Result<Value, String>) -> Option<Value> {
+        let file = self.cfg.hash.settings.with_file_name("first-rental.json");
+        let read = || std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(|v| v["rental"].is_string());
+        let st = st.as_ref().ok();
+        let first = match read() {
+            // the kept one, brought up to date while the status still lists it
+            Some(k) => st.and_then(|v| first_paid(&json!({"rentals": same_only(&v["rentals"], &k), "finished": same_only(&v["finished"], &k)}))).unwrap_or(k),
+            None => st.and_then(first_paid)?,
+        };
+        // kept, or brought up to date; a failed write only means it is read from the status next time
+        if read().as_ref() != Some(&first) {
+            let _ = write_settings(&file, &first);
+        }
+        Some(first)
     }
 
     pub(crate) fn sell_hashrate_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {

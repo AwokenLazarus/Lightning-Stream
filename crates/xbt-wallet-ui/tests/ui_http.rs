@@ -3399,6 +3399,9 @@ impl xbt_signer::ln::LnBackend for ChannelsLn {
 
 /// What the hashmaker's /status says in the checklist test: 0 before anything is set up, 1 once it all is.
 static RENT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The rentals the hashmaker's /status lists in the checklist test, once it is all set up: 0 none, 1 one going on and
+/// paid, 2 the same one ended with its miner home, 3 none again (the hashmaker restarted and forgot it).
+static RENT_PAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Sell → Hashrate's checklist: each thing renting out needs, in order, done or with its one next step; how much
 /// the node can be paid, and when nothing, why and what to do in plain words; one line once all is done.
@@ -3408,12 +3411,24 @@ static RENT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    RENT_PAID.store(0, std::sync::atomic::Ordering::SeqCst);
     let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
-        ("GET", "/status") if RENT_READY.load(std::sync::atomic::Ordering::SeqCst) => json!({"open": true,
+        ("GET", "/status") if RENT_READY.load(std::sync::atomic::Ordering::SeqCst) => {
+            let paid = RENT_PAID.load(std::sync::atomic::Ordering::SeqCst);
+            // a rental from someone else's box: 3 pieces paid at 40 sats, 25 shares proven by the hashmaker's own check
+            let rental = json!({"rental": "ab12", "startedMs": 1_000, "paid": 3, "earnedMsat": 120_000, "miners": ["S19"],
+                                "meter": {"work": "422212465065984", "proven": 25, "accepted": 0},
+                                "stopped": if paid == 2 { json!({"reason": "the hashtaker ended it", "atMs": 90_000}) } else { Value::Null }});
+            // an earlier one that paid nothing: no evidence of anything
+            let unpaid = json!({"rental": "cd34", "startedMs": 500, "paid": 0, "earnedMsat": 0, "meter": {"work": "0", "proven": 0}, "stopped": {"reason": "no payment"}});
+            json!({"open": true,
             "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
-            "minersAddress": "umbrel.local:23340", "rentals": [],
-            "miners": [{"name": "S19", "connected": true, "hashrateHs": 1.0e14, "earnedMsat": 0, "rentedTo": null}],
-            "listing": {"ok": true, "miners": 1, "freeMiners": 1}}),
+            "minersAddress": "umbrel.local:23340",
+            "rentals": if paid == 1 { json!([rental]) } else { json!([]) },
+            "finished": match paid { 0 | 1 => json!([unpaid]), 2 => json!([unpaid, rental]), _ => json!([]) },
+            "miners": [{"name": "S19", "connected": true, "hashrateHs": 1.0e14, "earnedMsat": 0, "rentedTo": if paid == 1 { json!("ab12") } else { Value::Null }}],
+            "listing": {"ok": true, "miners": 1, "freeMiners": 1}})
+        }
         ("GET", "/status") => json!({"open": false, "settings": {"enabled": false, "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
                                       "minersAddress": "umbrel.local:23340", "miners": [], "rentals": []}),
         _ => json!({"error": "no"}),
@@ -3446,11 +3461,12 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
     let list = &list[..list.find("</section>").unwrap()];
     assert!(p.find("id=\"rent-checklist\"").unwrap() < p.find("id=\"rent-form\"").unwrap(), "near the top, before the form");
-    assert!(list.contains("Before you rent out") && list.contains("1 of 5 done"), "{list}");
+    assert!(list.contains("Before you rent out") && list.contains("1 of 6 done"), "{list}");
     // in order, the XBT node done, the Lightning node the step to do now, with its one button
     let at = |s: &str| list.find(s).unwrap_or_else(|| panic!("{s} missing: {list}"));
     assert!(at("Your XBT node answers") < at("Your Lightning node is connected") && at("Your Lightning node is connected") < at("You can receive payments")
-            && at("You can receive payments") < at("Your miners are connected") && at("Your miners are connected") < at("Your offer is listed"), "{list}");
+            && at("You can receive payments") < at("Your miners are connected") && at("Your miners are connected") < at("Your offer is listed")
+            && at("Your offer is listed") < at("A first rental has been paid"), "{list}");
     assert!(list.contains("<li class=\"done\"><strong>Your XBT node answers</strong>"), "{list}");
     assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node is connected</strong>") && list.contains("href=\"./sell\">Connect it</a>"), "{list}");
     assert_eq!(list.matches("button-link").count(), 1, "one button, on the step to do now: {list}");
@@ -3469,14 +3485,46 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "39000", "remote_balance": "60000",
                                         "remote_constraints": {"chan_reserve_sat": "1000"}})];
     RENT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
-    let p = br.get("/sell-hashrate").body;
-    assert!(p.contains("<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span></p>"), "{p}");
-    assert!(!p.contains("Before you rent out"), "{p}");
+    // ready to be rented, but nobody has yet: the last line says why this box can't test itself and how to get a first
+    // rental, with no button (it comes from another box), and a rental that paid nothing does not tick it
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(list.contains("<span class=\"pill good\">Ready to be rented</span>") && list.contains("5 of 6 done"), "{list}");
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>A first rental has been paid</strong>"), "{list}");
+    assert!(list.contains("Nobody has rented your miners yet.") && list.contains("a Lightning node can't pay itself")
+            && list.contains("ask another Lightning Stream user to try one piece of yours") && list.contains("rent from a second box")
+            && list.contains("shows the work your miners delivered and the sats you were paid"), "{list}");
+    assert!(!list.contains("button-link"), "nothing on this box to press for it: {list}");
+    assert!(!settings.with_file_name("first-rental.json").exists(), "nothing kept before a rental paid");
+    // a rental going on that has paid: done, with what it delivered and earned, as the hashmaker counted it
+    RENT_PAID.store(1, std::sync::atomic::Ordering::SeqCst);
+    let first = "Your first rental: 3 pieces of work paid, 120 sats earned, 25 shares checked by your node.";
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&format!("<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span> <span class=\"small\">{first} It is going on now.</span></p>")), "{p}");
+    assert!(!p.contains("Before you rent out") && !p.contains("back on your own pool"), "{p}");
+    // ended, its miner home: said so
+    RENT_PAID.store(2, std::sync::atomic::Ordering::SeqCst);
+    let home = format!("{first} It has ended, and your miners are back on your own pool.");
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&home), "{p}");
+    // the hashmaker restarted and forgot its ended rentals: the box keeps its first rental, and claims nothing it can't see
+    RENT_PAID.store(3, std::sync::atomic::Ordering::SeqCst);
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&format!("Ready to be rented</span> <span class=\"small\">{first} It has ended")), "kept: {p}");
+    assert!(settings.with_file_name("first-rental.json").exists());
     // with some room, the line says how much (the box not yet otherwise ready, so the list is shown)
     RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     let p = unescape(&br.get("/sell-hashrate").body);
     assert!(p.contains("<li class=\"done\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 59,000 sats.</span>"), "{p}");
-    assert!(p.contains("3 of 5 done"), "{p}");
+    assert!(p.contains("4 of 6 done"), "the first rental kept: {p}");
+    // room for less than one piece of work of this offer (40 sats, as the hashmaker charges): not done, said with the fix
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "98970", "remote_balance": "1030",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains("<li class=\"now\" aria-current=\"step\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 30 sats, less than one piece of work costs (40 sats). \
+                        To make room, ask another node to open a channel to you"), "{p}");
+    assert!(p.contains("3 of 6 done"), "{p}");
 }
 
 /// says why in plain words; the address is set, and cleared, on the page.
