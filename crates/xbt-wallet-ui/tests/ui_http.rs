@@ -3144,9 +3144,13 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Services → Hashrate: the offers, the rental going on, renting and cutting
     let p = br.get("/hashrate");
     assert_eq!(p.status, 200);
-    for s in ["Ready to rent", "Basement miners", "1 of 2 machines free", "Rent", "Hashrate from Basement miners", "200 sats", "Cut", "Lazarus Pool"] {
+    for s in ["Basement miners", "1 of 2 machines free", "Rent", "Hashrate from Basement miners", "200 sats", "Cut", "Lazarus Pool"] {
         assert!(p.body.contains(s), "{s} missing from Hashrate");
     }
+    // no Lightning node connected here: not "Ready to rent", and Before you rent says the node is the step to do now
+    assert!(!p.body.contains("Ready to rent") && p.body.contains("<h2>Before you rent</h2>")
+            && p.body.contains("<li class=\"done\"><strong>Your gateway masks its jobs</strong>")
+            && p.body.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node can pay</strong>"), "{}", p.body);
     plain("/hashrate", &p.body);
     // the rental going on is under Your rentals; the ended ones only under History, newest first, with their count
     let (yours, history) = p.body.split_at(p.body.find("<details class=\"card rentals-history\"").expect("History"));
@@ -5459,7 +5463,7 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
         let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
         let card = &card[..card.find("</section>").unwrap()];
         if masked {
-            assert!(p.body.contains("Ready to rent") && !p.body.contains("masking its jobs"), "{}", p.body);
+            assert!(p.body.contains("<li class=\"done\"><strong>Your gateway masks its jobs</strong>") && !p.body.contains("masking its jobs"), "{}", p.body);
             assert!(card.contains("<button>Rent</button>"), "{card}");
         } else {
             assert!(p.body.contains("Your gateway isn&#39;t masking its jobs") || p.body.contains("Your gateway isn't masking its jobs"), "{}", p.body);
@@ -5467,7 +5471,11 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
             assert!(card.contains("<button disabled>Rent</button>"), "{card}");
             assert!(!p.body.contains("can't be checked") && !p.body.contains("refused"), "no scary words: {}", p.body);
             let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("budget", "1000"), ("minutes", "60"), ("miners", "1")]);
-            assert!(br.flash_after(&r).contains("Nothing was paid"));
+            // what is wrong, and where it is fixed
+            let said = br.flash_after(&r);
+            assert!(said.starts_with("Not rented. Nothing was paid. Your gateway isn't masking its jobs: Your gateway, at the end of this page, says what to do."), "{said}");
+            let r = br.act("/hashrate", "/hashrate", &[("action", "trial"), ("key", "02bb")]);
+            assert!(br.flash_after(&r).starts_with("Not started. Nothing was paid."));
             assert!(!rseen.lock().unwrap().iter().any(|(m, p, _, _)| m == "POST" && p == "/rent"), "no rent reached the renter's service");
         }
     }
@@ -5562,7 +5570,7 @@ fn rules_without_the_hashrate_task_say_so_and_add_only_that_task_to_sign() {
 
     // Rent is on, and the rules page shows the task read-only
     let p = br.get("/hashrate").body;
-    assert!(p.contains("Ready to rent") && !p.contains("id=\"rent-rules\""), "{p}");
+    assert!(p.contains("<li class=\"done\"><strong>Your spending rules allow renting</strong>") && !p.contains("id=\"rent-rules\""), "{p}");
     assert!(big(&p).contains("<button>Rent</button>"), "{}", big(&p));
     let pol = br.get("/policy").body;
     let task = &pol[pol.find("id=\"renting-hashrate\"").expect(&pol)..];
@@ -5598,6 +5606,101 @@ fn rules_with_tickets_off_say_so_on_the_hashrate_page() {
     let c = &p[p.find("<h3>Big miners</h3>").unwrap()..];
     assert!(c[..c.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
     assert!(br.get("/policy?task=hashrate").body.contains("Stream tickets are off in your spending rules"));
+}
+
+/// A first renter: "Before you rent" lists what renting needs (the Lightning node, the rules, the gateway, an offer, a
+/// hashmaker allowed), each done or with its one next step, and the page never says "Ready to rent" while the node can't
+/// pay. A rental that ended at its first payment says where the node is looked at, and a Rent refused because this
+/// node's own channels can't send says so, not that the seller's node is out of reach.
+///
+/// FAILS before: the page said "Ready to rent" with no Lightning node at all; the ended rental said only "your wallet
+/// could not pay for the first piece of work"; the refusal blamed the seller's node, and ended in "..".
+#[test]
+fn the_rent_page_lists_what_a_first_rental_needs_with_each_next_step() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn status() -> Value {
+        json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []},
+               "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."},
+               "rentals": [{"rental": "r1", "hasher": "Kilohash", "trial": true, "miners": 1, "budgetSats": 40, "startedMs": 1000, "ended": true,
+                            "live": {"closed": "the first slice could not be paid", "paidSlices": 0, "spentMsat": 0, "miners": 0}}]})
+    }
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => status(),
+        ("GET", "/offers") => offers_one(),
+        // the route probe found this wallet's own channels short: the service's words blame the seller's node
+        ("POST", "/rent") => json!({"error": "Your wallet can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive): nothing was paid.",
+                                    "unreachable": true, "probe": "the wallet's channels can't send 546000 msat"}),
+        _ => json!({"error": "no"}),
+    });
+    let (empty, _seen2) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []},
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}, "rentals": []}),
+        ("GET", "/offers") => json!({"offers": [], "looking": false, "relaysAnswered": true}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let list_of = |p: &str| {
+        let l = &p[p.find("id=\"rent-checklist\"").unwrap_or_else(|| panic!("no checklist: {p}"))..];
+        l[..l.find("</section>").unwrap()].to_string()
+    };
+
+    // no Lightning node: the first step, with its one button; everything else done
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate").body;
+    assert!(!p.contains("Ready to rent"), "{p}");
+    let list = list_of(&p);
+    assert!(p.find("id=\"rent-checklist\"").unwrap() < p.find("<h2 id=\"offers\">Miners for rent</h2>").unwrap(), "above the offers");
+    assert!(list.contains("<h2>Before you rent</h2>") && list.contains("4 of 5 done"), "{list}");
+    let at = |s: &str| list.find(s).unwrap_or_else(|| panic!("{s} missing: {list}"));
+    assert!(at("Your Lightning node can pay") < at("Your spending rules allow renting") && at("Your spending rules allow renting") < at("Your gateway masks its jobs")
+            && at("Your gateway masks its jobs") < at("Miners are free to rent") && at("Miners are free to rent") < at("A hashmaker is allowed to be paid"), "{list}");
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node can pay</strong>")
+            && list.contains("Connect it first.") && list.contains("href=\"./lightning\">Connect it</a>"), "{list}");
+    assert_eq!(list.matches("button-link").count(), 1, "one button, on the step to do now: {list}");
+    for done in ["Your spending rules allow renting", "Your gateway masks its jobs", "Miners are free to rent", "A hashmaker is allowed to be paid"] {
+        assert!(list.contains(&format!("<li class=\"done\"><strong>{done}</strong>")), "{done}: {list}");
+    }
+    // the test slice that ended at its first payment: where the node that pays is looked at
+    let card = &p[p.find("Test slice from Kilohash").expect(&p)..];
+    let card = &card[..card.find("</section>").unwrap()];
+    assert!(card.contains("Each piece of work is paid from your Lightning node") && card.contains("<a href=\"./lightning\">Your node and channels</a>"), "{card}");
+    // Rent refused because this node's own channels are short: said as that, with where to fix it, once
+    for (action, lead) in [("rent", "Not rented"), ("trial", "Not started")] {
+        let r = br.act("/hashrate", "/hashrate", &[("action", action), ("key", "02bb"), ("budget", "1000"), ("minutes", "60"), ("miners", "1")]);
+        let said = br.flash_after(&r);
+        assert_eq!(said, format!("{lead}: your Lightning node can't send the first payment right now. Nothing was paid. Add sending balance on Settings → Your node, then try again."));
+    }
+
+    // a node connected that can't pay yet (paying off in the rules): its own step, "See why"
+    let ln = Arc::new(ChannelsLn(std::sync::Mutex::new(vec![
+        json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "99000", "remote_balance": "0"})])));
+    let ldir = tempfile::tempdir().unwrap();
+    env_for(ldir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(ldir.path(), &runbook_policy(miners_allowed()));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln: Some(ln), ..Default::default() }).unwrap();
+    let bx = start_on(Rig { dir: ldir, root, chain, s, witness: None }, |c| {
+        c.hash.renter = Some(empty.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate").body;
+    let list = list_of(&p);
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node can pay</strong>")
+            && list.contains("connected but can&#39;t pay yet") && list.contains("href=\"./lightning\">See why</a>"), "{list}");
+    // no offer: said, with no button (offers come from other people), and Allow waits for one
+    assert!(list.contains("No other hashmaker has miners free right now.") && list.contains("Once an offer shows, press Allow this hashmaker to be paid on it"), "{list}");
+    assert!(!list.contains("href=\"#offers\""), "{list}");
+    let words = main_words(&p);
+    for j in ["macaroon", "msat", "millisat", "preimage", "upstream", "htlc", "cltv", "receipt key", "mcp", "nwc", "xbt_ui_"] {
+        assert!(!words.contains(j), "\"{j}\" on the main screen: {words}");
+    }
 }
 
 /// Just started, the renter is still looking for offers on Nostr: the page says so and looks again by itself, and the
@@ -6059,7 +6162,7 @@ fn the_rent_page_shows_the_bundled_gateways_state() {
         (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(true), false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
          "Lazarus Pool doesn&#39;t take gateway keys yet", false, 2),
         (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(true), true, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
-         "Ready to rent", true, 3),
+         "<li class=\"done\"><strong>Your gateway masks its jobs</strong>", true, 3),
     ];
     for (answer, head, can, good) in cases {
         let (renter, _seen) = control_standin(answer);
