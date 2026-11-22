@@ -3581,8 +3581,14 @@ fn the_sell_page_warns_when_buyers_cannot_pay_yet() {
 
     // a shop gets an offer
     let addr = format!("http://{media}");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Test box"), ("public_url", "https://seller.example/")]);
+    assert!(br.flash_after(&r).contains("network id"), "a test chain asks for its network under Advanced");
+    let r = br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                                       ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    assert!(br.flash_after(&r).contains("Advanced settings saved"));
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib")]);
-    assert!(br.flash_after(&r).contains("restarts"), "the offer was added");
+    let f = br.flash_after(&r);
+    assert!(f.contains("restarts"), "the offer was added: {f} {}", unescape(&r.body));
 
     // (1) an offer and no room at all
     let p = unescape(&br.get("/sell").body);
