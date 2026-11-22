@@ -3091,6 +3091,9 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Sell hashrate");
     }
     assert!(p.body.contains("href=\"./sell-hashrate\" aria-current"), "Hashrate is a tab of Sell");
+    // Home says the same of the miners as this page: a box that only rents them out is selling (issue #75)
+    let home = br.get("/").body;
+    assert!(home.contains("Renting out: 1 of 2 miners rented") && home.contains("href=\"./sell-hashrate\""), "Home leaves the rented miners out: {home}");
     assert!(br.get("/browse").body.contains("href=\"./hashrate\""), "and of Services");
     plain("/sell-hashrate", &p.body);
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "stop"), ("rental", "r1")]);
