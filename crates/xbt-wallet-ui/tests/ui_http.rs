@@ -3546,6 +3546,60 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     assert!(!list.contains("cannot connect") && !list.contains("401"), "{list}");
 }
 
+/// A shop with something to sell and no room to be paid says so on the Sell page, in the Hashrate page's words;
+/// room for a buyer's smallest payment, no offer, or a node whose channels are not known, says nothing.
+#[test]
+fn the_sell_page_warns_when_buyers_cannot_pay_yet() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let media = mock_http(|_| (200, "ok"));
+    // one channel, all of it on this side: nothing can come in
+    let ln = Arc::new(ChannelsLn(std::sync::Mutex::new(vec![
+        json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "99000", "remote_balance": "0"})])));
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln: Some(ln.clone()), ..Default::default() }).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let gw = side.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    // the shop's keys to the node, so the app counts the node as connected
+    std::fs::write(gw.join("invoices.macaroon"), "00").unwrap();
+    std::fs::write(gw.join("info.macaroon"), "00").unwrap();
+    let gw2 = gw.clone();
+    let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| {
+        c.sell = true;
+        c.gw.dir = gw2;
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    });
+    let mut br = logged_in(&bx);
+    let warn = "Buyers can't pay you yet.";
+
+    // (4) nothing to sell yet: no warning, even with no room
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains("Not selling yet") && !p.contains(warn), "{p}");
+
+    // a shop gets an offer
+    let addr = format!("http://{media}");
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib")]);
+    assert!(br.flash_after(&r).contains("restarts"), "the offer was added");
+
+    // (1) an offer and no room at all
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains("<div class=\"flash warn\"><strong>Buyers can't pay you yet.</strong>"), "{p}");
+    assert!(p.contains("Buyers pay you through your channels") && p.contains("href=\"./lightning\">Your node and channels</a>"), "{p}");
+    // (2) some room, less than a buyer's smallest payment (a ticket: 546 sats)
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "98970", "remote_balance": "1030",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains(warn) && p.contains("less than a buyer's smallest payment (546 sats)"), "{p}");
+    // (3) plenty of room: nothing said
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "39000", "remote_balance": "60000",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell").body);
+    assert!(!p.contains(warn) && !p.contains("flash warn"), "{p}");
+}
+
 /// says why in plain words; the address is set, and cleared, on the page.
 #[test]
 fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
