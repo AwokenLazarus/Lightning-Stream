@@ -3447,6 +3447,8 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     let gw = side.path().join("gateway");
     std::fs::create_dir_all(&gw).unwrap();
     let (gw2, settings) = (gw.clone(), side.path().join("hashrate/settings.json"));
+    // where the box keeps its first rental, beside the renting settings
+    let kept = settings.with_file_name("first-rental.json");
     let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| {
         c.sell = true;
         c.gw.dir = gw2;
@@ -3496,7 +3498,7 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
             && list.contains("ask another Lightning Stream user to try one piece of yours") && list.contains("rent from a second box")
             && list.contains("shows the work your miners delivered and the sats you were paid"), "{list}");
     assert!(!list.contains("button-link"), "nothing on this box to press for it: {list}");
-    assert!(!settings.with_file_name("first-rental.json").exists(), "nothing kept before a rental paid");
+    assert!(!kept.exists(), "nothing kept before a rental paid");
     // a rental going on that has paid: done, with what it delivered and earned, as the hashmaker counted it
     RENT_PAID.store(1, std::sync::atomic::Ordering::SeqCst);
     let first = "Your first rental: 3 pieces of work paid, 120 sats earned, 25 shares checked by your node.";
@@ -3512,7 +3514,7 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     RENT_PAID.store(3, std::sync::atomic::Ordering::SeqCst);
     let p = unescape(&br.get("/sell-hashrate").body);
     assert!(p.contains(&format!("Ready to be rented</span> <span class=\"small\">{first} It has ended")), "kept: {p}");
-    assert!(settings.with_file_name("first-rental.json").exists());
+    assert!(kept.exists());
     // with some room, the line says how much (the box not yet otherwise ready, so the list is shown)
     RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     let p = unescape(&br.get("/sell-hashrate").body);
