@@ -2230,6 +2230,26 @@ fn th_hours(x: f64) -> String {
     }
 }
 
+/// The hashmaker's state as (pill class, headline, next step), from its `/status` and the saved
+/// settings (which win over what the hashmaker last read). Sell → Hashrate and Home both say this.
+pub(crate) fn renting_state(st: &Result<Value, String>, saved: &Value) -> (&'static str, String, String) {
+    let settings = st.as_ref().ok().map(|s| s["settings"].clone()).unwrap_or(json!({}));
+    let pick = |k: &str| saved.get(k).filter(|v| !v.is_null()).cloned().or_else(|| settings.get(k).filter(|v| !v.is_null()).cloned());
+    let on = pick("enabled") == Some(Value::Bool(true));
+    let fallback = pick("fallback").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    let miners: Vec<Value> = st.as_ref().ok().and_then(|s| s["miners"].as_array().cloned()).unwrap_or_default();
+    let live = miners.iter().filter(|m| m["connected"] == true).count();
+    let rented = miners.iter().filter(|m| !m["rentedTo"].is_null()).count();
+    match st {
+        Err(e) => ("bad", "Can't reach the hashrate service".to_string(), e.clone()),
+        Ok(_) if !on || fallback.is_empty() => ("warn", "Not renting out".to_string(),
+            "Say where your miners hash when nobody rents them, then turn renting on below.".to_string()),
+        Ok(_) if live == 0 => ("warn", "Renting is on, no miners yet".to_string(), "Point your miners at the address below.".to_string()),
+        Ok(_) => ("good", format!("Renting out: {rented} of {live} miner{} rented", if live == 1 { "" } else { "s" }),
+                  if rented == 0 { "The others hash for your own pool until someone rents them.".into() } else { String::new() }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// An offer names its seller by the shop's listed name; its address only where no listing names it.
@@ -2872,25 +2892,5 @@ mod tests {
                        "live": {"closed": "the task's budget in the wallet's rules is used up", "paidSlices": 40, "spentMsat": 2_040_000}});
         let card = rental_card(&ctx, &t, "hashrate");
         assert!(card.contains("<strong>Ended:</strong> the budget your spending rules give hashrate rentals was spent.") && !card.contains("20,202 sats)"), "{card}");
-    }
-}
-
-/// The hashmaker's state as (pill class, headline, next step), from its `/status` and the saved
-/// settings (which win over what the hashmaker last read). Sell → Hashrate and Home both say this.
-pub(crate) fn renting_state(st: &Result<Value, String>, saved: &Value) -> (&'static str, String, String) {
-    let settings = st.as_ref().ok().map(|s| s["settings"].clone()).unwrap_or(json!({}));
-    let pick = |k: &str| saved.get(k).filter(|v| !v.is_null()).cloned().or_else(|| settings.get(k).filter(|v| !v.is_null()).cloned());
-    let on = pick("enabled") == Some(Value::Bool(true));
-    let fallback = pick("fallback").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-    let miners: Vec<Value> = st.as_ref().ok().and_then(|s| s["miners"].as_array().cloned()).unwrap_or_default();
-    let live = miners.iter().filter(|m| m["connected"] == true).count();
-    let rented = miners.iter().filter(|m| !m["rentedTo"].is_null()).count();
-    match st {
-        Err(e) => ("bad", "Can't reach the hashrate service".to_string(), e.clone()),
-        Ok(_) if !on || fallback.is_empty() => ("warn", "Not renting out".to_string(),
-            "Say where your miners hash when nobody rents them, then turn renting on below.".to_string()),
-        Ok(_) if live == 0 => ("warn", "Renting is on, no miners yet".to_string(), "Point your miners at the address below.".to_string()),
-        Ok(_) => ("good", format!("Renting out: {rented} of {live} miner{} rented", if live == 1 { "" } else { "s" }),
-                  if rented == 0 { "The others hash for your own pool until someone rents them.".into() } else { String::new() }),
     }
 }
