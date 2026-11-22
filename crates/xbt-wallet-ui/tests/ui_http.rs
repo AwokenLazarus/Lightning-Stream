@@ -3520,11 +3520,11 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     let p = unescape(&br.get("/sell-hashrate").body);
     assert!(p.contains("<li class=\"done\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 59,000 sats.</span>"), "{p}");
     assert!(p.contains("4 of 6 done"), "the first rental kept: {p}");
-    // room for less than one piece of work of this offer (40 sats, as the hashmaker charges): not done, said with the fix
+    // room for less than a hashtaker's smallest payment (a ticket: 546 sats, above this offer's 40 sats a piece): not done, said with the fix
     *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "98970", "remote_balance": "1030",
                                         "remote_constraints": {"chan_reserve_sat": "1000"}})];
     let p = unescape(&br.get("/sell-hashrate").body);
-    assert!(p.contains("<li class=\"now\" aria-current=\"step\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 30 sats, less than one piece of work costs (40 sats). \
+    assert!(p.contains("<li class=\"now\" aria-current=\"step\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 30 sats, less than a hashtaker's smallest payment (546 sats). \
                         To make room, ask another node to open a channel to you"), "{p}");
     assert!(p.contains("3 of 6 done"), "{p}");
 }

@@ -455,15 +455,17 @@ fn receive_words(receivable: Option<i64>, price: Option<u64>) -> String {
     match receivable {
         None => "The app cannot see your channels yet. Connect your node on Your node to see how much you can receive.".into(),
         Some(0) => format!("Can receive about 0 sats. Hashtakers pay you through your channels, and none of them has room for a payment to come in. {MAKE_ROOM}"),
-        // a hashtaker pays a piece at a time: room for less than one piece is room for no payment of this offer
+        // a hashtaker pays in tickets, none smaller than `price` here (the smallest ticket of this offer): room
+        // for less is room for no payment at all
         Some(n) => match price.filter(|p| (n as u64) < *p) {
-            Some(p) => format!("Can receive about {}, less than one piece of work costs ({}). {MAKE_ROOM}", sats_n(n as f64), sats_n(p as f64)),
+            Some(p) => format!("Can receive about {}, less than a hashtaker's smallest payment ({}). {MAKE_ROOM}", sats_n(n as f64), sats_n(p as f64)),
             None => format!("Can receive about {}.", sats_n(n as f64)),
         },
     }
 }
 
-/// Whether the node can be paid for this offer: room for one piece of work when its price is known, for anything otherwise.
+/// Whether the node can be paid for this offer: room for a hashtaker's smallest payment (`price`) when that is
+/// known, for anything otherwise.
 fn can_receive(receivable: Option<i64>, price: Option<u64>) -> bool {
     receivable.is_some_and(|r| r > 0 && price.is_none_or(|p| r as u64 >= p))
 }
@@ -1037,7 +1039,8 @@ impl App {
         let receivable = crate::pay_feedback::receivable_sats(&ln);
         let listing = st.as_ref().ok().map(|s| s["listing"].clone()).unwrap_or(Value::Null);
         let listed = listing["ok"] == true;
-        let price = piece_price(st, &self.hash_settings());
+        // the least a hashtaker ever pays at once: a ticket, never under 546 sats, or one piece where that costs more
+        let least = piece_price(st, &self.hash_settings()).map(|p| smallest_ticket_sat(p as f64));
         let first = self.first_rental(st);
         // (done, title, the state or the one next step, where to go, its button)
         let steps: Vec<(bool, &str, String, &str, &str)> = vec![
@@ -1048,7 +1051,7 @@ impl App {
             (connected, "Your Lightning node is connected",
              if connected { "Hashtakers pay you through it.".into() } else { "Hashtakers pay you through your Lightning node. Connect it on Sell.".into() },
              "./sell", "Connect it"),
-            (can_receive(receivable, price), "You can receive payments", receive_words(receivable, price), "./lightning", "Your node and channels"),
+            (can_receive(receivable, least), "You can receive payments", receive_words(receivable, least), "./lightning", "Your node and channels"),
             (!fallback.is_empty() && live > 0, "Your miners are connected",
              if fallback.is_empty() {
                  "Say where your miners hash when nobody rents them, in the form below.".into()
