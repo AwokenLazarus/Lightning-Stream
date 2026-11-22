@@ -1187,7 +1187,8 @@ impl App {
         } else if ack {
             "<span class=\"pill warn\">One last step</span> Confirm that the app may pay with real money. <a href=\"./lightning#ack\">Start paying</a>".into()
         } else if connected {
-            "<span class=\"pill warn\">Can't pay yet</span> Your Lightning node is connected but cannot pay for services yet. Selling does not need this. <a href=\"./lightning\">See why</a>".into()
+            format!("<span class=\"pill warn\">Can't pay yet</span> Your Lightning node is connected but cannot pay yet.{} <a href=\"./lightning\">See why</a>",
+                    if self.cfg.sell || renting.is_some() { " Selling does not need this." } else { "" })
         } else {
             "<span class=\"pill warn\">Not connected</span> Connect your Lightning node to pay for services. <a href=\"./lightning\">Connect it</a>".into()
         };
