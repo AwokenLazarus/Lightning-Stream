@@ -530,6 +530,22 @@ fn first_paid_words(first: &Value, st: &Result<Value, String>) -> String {
     w
 }
 
+/// A checklist's steps (done, title, the state or the one next step, where to go, its button), as the Sell and Rent
+/// hashrate pages show them: each done or not, the first one left to do marked, with its button.
+fn checklist_steps(steps: &[(bool, &str, String, &str, &str)]) -> String {
+    let next = steps.iter().position(|s| !s.0).unwrap_or(0);
+    let mut b = String::from("<ol class=\"checklist\">");
+    for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
+        // a step with nowhere to go (the XBT node is set up outside the app) says what to check, with no button
+        let action = if i == next && !href.is_empty() { format!("<p><a class=\"button-link primary\" href=\"{href}\">{}</a></p>", esc(button)) } else { String::new() };
+        b.push_str(&format!("<li class=\"{}\"{}><strong>{}</strong> <span class=\"small\">{}</span>{action}</li>",
+                            if *ok { "done" } else if i == next { "now" } else { "" }, if i == next { " aria-current=\"step\"" } else { "" },
+                            esc(title), esc(what)));
+    }
+    b.push_str("</ol>");
+    b
+}
+
 /// What the last line says until a rental has paid: why the box can't test itself, and how to get a first rental.
 const NO_RENTAL_YET: &str = "Nobody has rented your miners yet. This box can't rent its own miners, because a Lightning node can't pay itself. \
     To see it work before a stranger rents, ask another Lightning Stream user to try one piece of yours (on Rent hashrate, Try one slice first), \
@@ -635,11 +651,67 @@ fn wallet_refusal(why: &str) -> Option<String> {
     Some(format!("<p class=\"hint\">Your wallet refused to pay this hashmaker: {}.{todo}{code}</p>{over}", esc(reason)))
 }
 
+/// "Before you rent"'s first line: whether the Lightning node can pay a rental's first payment (`least`, in sats), in
+/// Home's order (connected, the yes to real money, ready, what it can send), with its one next step: (done, the words,
+/// where to go, its button). `spendable`: what the node can send, about ([`crate::pay_feedback::spendable_sats`]); None
+/// where its channels weren't read, and then no amount is claimed.
+fn pay_step(connected: bool, ack: bool, ready: bool, spendable: Option<i64>, least: u64) -> (bool, String, &'static str, &'static str) {
+    if !connected {
+        (false, "The app pays for rented work through your own Lightning node. Connect it first.".into(), "./lightning", "Connect it")
+    } else if ack {
+        (false, "Confirm that the app may pay with real money, within your spending rules.".into(), "./lightning#ack", "Start paying")
+    } else if !ready {
+        (false, "Your Lightning node is connected but can't pay yet.".into(), "./lightning", "See why")
+    } else {
+        match spendable {
+            Some(n) if n < least as i64 => (false, format!("Your Lightning node can send about {}, less than a rental's smallest payment ({}). \
+                Add sending balance, or open a channel.", sats_n(n as f64), sats_n(least as f64)), "./lightning", "Your node and channels"),
+            Some(n) => (true, format!("Your Lightning node can send about {}.", sats_n(n as f64)), "", ""),
+            None => (true, "Your Lightning node is ready to pay.".into(), "", ""),
+        }
+    }
+}
+
+/// A Rent or Try one slice the renter's service refused, as its message says it (`lead`: "Not rented"). Its own words,
+/// with one full stop: they may end in one already ("…: nothing was paid.." before). A route probe that found the
+/// wallet's own channels can't send the first payment is said as that, with where to fix it: the service's words
+/// blame the seller's node for it.
+fn not_started(lead: &str, v: &Value) -> String {
+    // the signer's words for its own node's "insufficient local balance" (xbt-signer's ln_route_probe)
+    if v["probe"].as_str().is_some_and(|p| p.starts_with("the wallet's channels can't send")) {
+        return format!("{lead}: your Lightning node can't send the first payment right now. Nothing was paid. \
+                        Add sending balance on Settings → Your node, then try again.");
+    }
+    match v["error"].as_str().map(|e| e.trim().trim_end_matches('.')).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{lead}: {e}."),
+        None => format!("{lead}."),
+    }
+}
+
+/// A closed rental's reason without the side that closed it ("hashmaker closed: unpaid" is "unpaid").
+fn closed_reason(why: &str) -> &str {
+    // the earlier role names too: a hashlink from before the rename words its reasons with them
+    ["hashmaker closed: ", "hashtaker closed: ", "hasher closed: ", "buyer closed: "].iter().fold(why, |w, p| w.trim_start_matches(p))
+}
+
+/// What to do after a rental ended for a reason the renter can fix here, as a link to the page that fixes it: a payment
+/// that didn't go out goes through the renter's own Lightning node, and the rules' budget is on the rules page. Empty
+/// for the rest. A first renter whose node couldn't pay read only "Your wallet could not pay for the first piece of
+/// work", with nowhere to go.
+fn ended_next_step(why: &str) -> &'static str {
+    match closed_reason(why) {
+        "the first slice could not be paid" | "no first payment" | "unpaid" =>
+            "<p class=\"hint\">Each piece of work is paid from your Lightning node. Check what it can send on \
+             <a href=\"./lightning\">Your node and channels</a>.</p>",
+        "the task's budget in the wallet's rules is used up" =>
+            "<p class=\"hint\">To rent more, raise it in your <a href=\"./policy\">spending rules</a>, and sign the change.</p>",
+        _ => "",
+    }
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
-    // the earlier role names too: a hashlink from before the rename words its reasons with them
-    let w = ["hashmaker closed: ", "hashtaker closed: ", "hasher closed: ", "buyer closed: "].iter().fold(why, |w, p| w.trim_start_matches(p));
-    match w {
+    match closed_reason(why) {
         "cut by the hashtaker" | "cut by the buyer" => "You cut it.".into(),
         "budget used up" | "budget reached" => "Its budget was spent.".into(),
         // the budget the owner's spending rules give the hashrate task (xbt_hashlink::order::TASK_BUDGET_USED_UP)
@@ -1095,18 +1167,8 @@ impl App {
         if done == steps.len() {
             return format!("<p class=\"status-line\" id=\"rent-checklist\">{ready_pill} <span class=\"small\">{}</span></p>", esc(&steps[steps.len() - 1].2));
         }
-        let next = steps.iter().position(|s| !s.0).unwrap_or(0);
-        let mut b = format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent out</h2>{}<p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
-                            if ready { format!("<p>{ready_pill}</p>") } else { String::new() }, steps.len());
-        for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
-            // a step with nowhere to go (the XBT node is set up outside the app) says what to check, with no button
-            let action = if i == next && !href.is_empty() { format!("<p><a class=\"button-link primary\" href=\"{href}\">{}</a></p>", esc(button)) } else { String::new() };
-            b.push_str(&format!("<li class=\"{}\"{}><strong>{}</strong> <span class=\"small\">{}</span>{action}</li>",
-                                if *ok { "done" } else if i == next { "now" } else { "" }, if i == next { " aria-current=\"step\"" } else { "" },
-                                esc(title), esc(what)));
-        }
-        b.push_str("</ol></section>");
-        b
+        format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent out</h2>{}<p class=\"small\">{done} of {} done</p>{}</section>",
+                if ready { format!("<p>{ready_pill}</p>") } else { String::new() }, steps.len(), checklist_steps(&steps))
     }
 
     /// The first rental that paid this box, as the hashmaker's status shows it, kept in `first-rental.json` beside the
@@ -1288,6 +1350,9 @@ impl App {
             // the gateway is ready: the rules are what renting waits for
             Some((rhead, rbody)) if class == "good" => b.push_str(&format!(
                 "<section class=\"status warn\" id=\"rent-rules\" aria-live=\"polite\"><p class=\"status-head\">{rhead}</p>{rbody}</section>")),
+            // the gateway is ready and so are the rules: "Before you rent" below says whether the rest is, so a box whose
+            // Lightning node can't pay is not told "Ready to rent" (it was, and its first rental failed at the first payment)
+            None if class == "good" => {}
             notice => {
                 b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p>{}</section>",
                                     if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
@@ -1296,6 +1361,8 @@ impl App {
                 }
             }
         }
+        // "Before you rent" goes here, once the offers below have said whether one can be rented and paid
+        let checklist_at = b.len();
         // moved to the bundled gateway at the upgrade: said once it happened, with the way back
         if let Some(from) = st["datum"]["movedFrom"].as_str().filter(|_| st["bundled"]["inUse"] == true) {
             b.push_str(&format!("<section class=\"card\"><p>Rented work now goes to the {} that comes with this app. It went to <code>{}</code> before, \
@@ -1328,10 +1395,16 @@ impl App {
         let tip = if solo { self.mining_tip().ok() } else { None };
 
         // the offers: the main action
-        b.push_str("<h2>Miners for rent</h2>");
+        b.push_str("<h2 id=\"offers\">Miners for rent</h2>");
+        // for "Before you rent": whether another hashmaker's offer can be rented (None: the offers couldn't be read),
+        // whether one of those may be paid, and the least its first payment can be
+        let mut rentable: Option<bool> = None;
+        let mut payable = false;
+        let mut least: Option<u64> = None;
         match offers {
             Err(e) => b.push_str(&App::error_box(&e)),
             Ok(o) => {
+                rentable = Some(false);
                 let offers: Vec<Value> = o["offers"].as_array().cloned().unwrap_or_default();
                 if offers.is_empty() {
                     b.push_str(&no_offers_words(&o));
@@ -1399,6 +1472,13 @@ impl App {
                     // an offer with no free machine or no hashrate is never paid (#70): its start fee would buy no work
                     let hashrate = if x.get("hashrateHs").is_some() { num(&x["hashrateHs"]) } else { free_hs };
                     let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && free > 0 && hashrate > 0.0;
+                    if !old && !mine && free > 0 && hashrate > 0.0 {
+                        rentable = Some(true);
+                        payable |= allowed;
+                        // a rental's first payment is a ticket for the start fee and a piece of work, never under 546 sats
+                        let first = smallest_ticket_sat(price + fee);
+                        least = Some(least.map_or(first, |l| l.min(first)));
+                    }
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
                     let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total, hashrate);
                     let (off_tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
@@ -1480,7 +1560,56 @@ impl App {
         }
         // your gateway: the bundled one's settings and state, and the way to another
         b.push_str(&self.gateway_card(&csrf, &st));
+        let list = self.before_you_rent(ready, head, rules, rentable, payable, least.unwrap_or(SMALLEST_TICKET_SAT));
+        b.insert_str(checklist_at, &list);
         self.html_page("Hashrate", "Hashrate", ctx, &b, "")
+    }
+
+    /// The Rent page's "Before you rent": what renting needs, in the order a renter does it, each done or not with its one
+    /// next step, as Sell → Hashrate's "Before you rent out" shows its own; one line once all is done. A first renter found
+    /// the pieces spread over the page, and the page said "Ready to rent" of a box whose Lightning node could not pay: the
+    /// rental then ended at its first payment. Built only from what the page already reads: the node's state and what it
+    /// can send, the signed rules, the gateway's state (`gateway_ready`, `gateway`: [`rent_status`]'s heading), and the
+    /// offers (`rentable`: one of another hashmaker's can be rented, None when they couldn't be read; `payable`: one of
+    /// those may be paid; `least`: the smallest first payment among them, in sats).
+    fn before_you_rent(&self, gateway_ready: bool, gateway: &str, rules: RentRules, rentable: Option<bool>, payable: bool, least: u64) -> String {
+        let (ln_ready, connected, _) = self.node_state();
+        let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+        let ack = connected && ln["real_money_ack_needed"] == true;
+        let (pays, pay_words, pay_href, pay_button) = pay_step(connected, ack, ln_ready, crate::pay_feedback::spendable_sats(&ln), least);
+        let (rules_words, rules_href, rules_button) = match rules {
+            RentRules::Allowed => ("Your wallet may pay for rented work, within the limits you signed.", "", ""),
+            RentRules::NoTask => ("Add renting hashrate to your spending rules, and sign the change.", "./policy?task=hashrate", "Allow renting hashrate"),
+            RentRules::TicketsOff => ("Stream tickets are off in your spending rules, and rented work is paid with them. Turn them on, and sign.",
+                                      "./policy", "Open your spending rules"),
+        };
+        let steps: Vec<(bool, &str, String, &str, &str)> = vec![
+            (pays, "Your Lightning node can pay", pay_words.clone(), pay_href, pay_button),
+            (rules == RentRules::Allowed, "Your spending rules allow renting", rules_words.into(), rules_href, rules_button),
+            (gateway_ready, "Your gateway masks its jobs",
+             if gateway_ready { "Rented work goes to it, and a hashmaker can't tell which shares win.".into() }
+             else { format!("{}. Your gateway, at the end of this page, says what to do.", gateway.trim_end_matches('.')) },
+             "#gateway", "Go to Your gateway"),
+            // nowhere to go for it: offers come from other people
+            (rentable == Some(true), "Miners are free to rent",
+             match rentable {
+                 Some(true) => "Another hashmaker has miners free now.".into(),
+                 Some(false) => "No other hashmaker has miners free right now. Their offers show below when they do.".into(),
+                 None => "The offers couldn't be read just now. Load this page again in a minute.".into(),
+             }, "", ""),
+            (payable, "A hashmaker is allowed to be paid",
+             if payable { "Your spending rules let the app pay one of them.".into() }
+             else if rentable == Some(true) { "Press Allow this hashmaker to be paid on an offer below, and sign the change.".into() }
+             else { "Once an offer shows, press Allow this hashmaker to be paid on it, and sign the change.".into() },
+             if rentable == Some(true) { "#offers" } else { "" }, "See the offers"),
+        ];
+        let done = steps.iter().filter(|s| s.0).count();
+        if done == steps.len() {
+            return format!("<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to rent</span> <span class=\"small\">{}</span></p>",
+                           esc(&pay_words));
+        }
+        format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent</h2><p class=\"small\">{done} of {} done</p>{}</section>",
+                steps.len(), checklist_steps(&steps))
     }
 
     /// The Hashrate page's rentals, for the page to show again while one is live: their cards, and whether one still is.
@@ -1523,10 +1652,17 @@ impl App {
         // the price the page showed, as it showed it (none from an older page: the service agrees to its offer as it reads it)
         let seen_n = |k: &str| g(k).parse::<u64>().ok();
         let seen_s = |k: &str| Some(g(k)).filter(|w| !w.is_empty() && w.bytes().all(|c| c.is_ascii_digit()));
+        // a rental waits for a gateway that masks its jobs: looked at again before anything is asked of the renter
+        let unmasked = matches!(g("action").as_str(), "rent" | "trial")
+            .then(|| call(&base, &token, "GET", "/status", None).ok().filter(|st| st["blinding"]["state"] != "blinded")).flatten();
         let r: Result<String, String> = match g("action").as_str() {
-            "rent" | "trial" if call(&base, &token, "GET", "/status", None).is_ok_and(|st| st["blinding"]["state"] != "blinded") => {
-                Err("Renting needs a gateway that masks its jobs. Nothing was paid.".into())
-            }
+            "rent" | "trial" if unmasked.is_some() => Err(unmasked.as_ref().map(|st| {
+                // the gateway's state as the page's notice heads it, and where its fix is (before, this said only that
+                // renting needs a gateway that masks its jobs, with nowhere to go)
+                let (_, head, _) = rent_status(st, self.stream_gw_here(), self.stream_gw_settings().is_some(), &|| self.node_trouble_words());
+                format!("Not {}. Nothing was paid. {head}: Your gateway, at the end of this page, says what to do.",
+                        if g("action") == "trial" { "started" } else { "rented" })
+            }).unwrap_or_default()),
             "rent" => {
                 if n("budget") == 0 {
                     Err("Set the most this rental may cost.".into())
@@ -1541,7 +1677,7 @@ impl App {
                                 let buys = piece.map(|p| format!(" {}", budget_buys(n("budget"), p, smallest_ticket_sat(p)))).unwrap_or_default();
                                 Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{buys}{}", may_buy(&v)))
                             }
-                            None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
+                            None => Err(not_started("Not rented", &v)),
                         })
                 }
             }
@@ -1550,7 +1686,7 @@ impl App {
                                                                        "seenStartSlices": seen_n("seen_start_slices")})))
                 .and_then(|v| match v["rental"].as_str() {
                     Some(_) => Ok(format!("Trying one slice, at most {}.{} When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])), may_buy(&v))),
-                    None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
+                    None => Err(not_started("Not started", &v)),
                 }),
             "attest" => call(&base, &token, "POST", "/attest", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true {
@@ -2143,6 +2279,11 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let refused = whys().find(|w| WORDS.iter().any(|s| w.starts_with(s))).map(|w| format!("<p class=\"hint\">{}</p>", esc(w)))
         // any other refusal of the wallet's is its own answer, as it gave it: said with what to do, not left in the API
         .or_else(|| whys().find_map(wallet_refusal)).unwrap_or_default();
+    // what to do about the end, where it is this box's to fix and no refusal above says it already
+    let next = match live["closed"].as_str() {
+        Some(w) if refused.is_empty() && !unreachable => ended_next_step(w),
+        _ => "",
+    };
     let cut = if ended {
         String::new()
     } else {
@@ -2187,7 +2328,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let miners = live["miners"].as_u64().unwrap_or(0);
     let rate = if ended { String::new() } else { format!(" · {} on {} machine{}", speed(hs), miners, if miners == 1 { "" } else { "s" }) };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid{rate}</p>{wallet}{refused}{why}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
+             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid{rate}</p>{wallet}{refused}{why}{next}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
     )
 }
@@ -2866,6 +3007,51 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// "Before you rent"'s Lightning line: each state with its one next step, and the node's amount against a rental's
+    /// smallest payment; no amount claimed where its channels weren't read.
+    #[test]
+    fn the_lightning_line_says_whether_the_node_can_pay_a_first_rental() {
+        assert_eq!(pay_step(false, false, false, None, 546).2, "./lightning");
+        assert_eq!(pay_step(true, true, false, Some(10_000), 546).2, "./lightning#ack");
+        let (ok, w, href, button) = pay_step(true, false, false, None, 546);
+        assert!(!ok && w.contains("can't pay yet") && href == "./lightning" && button == "See why", "{w}");
+        let (ok, w, href, _) = pay_step(true, false, true, Some(300), 546);
+        assert!(!ok && href == "./lightning", "{w}");
+        assert_eq!(w, "Your Lightning node can send about 300 sats, less than a rental's smallest payment (546 sats). Add sending balance, or open a channel.");
+        assert_eq!(pay_step(true, false, true, Some(12_000), 546), (true, "Your Lightning node can send about 12,000 sats.".into(), "", ""));
+        assert_eq!(pay_step(true, false, true, None, 546), (true, "Your Lightning node is ready to pay.".into(), "", ""));
+    }
+
+    /// A refused Rent says its reason with one full stop, and a route probe that found the wallet's own channels short
+    /// is said as that, with where to fix it, not as the seller's node being out of reach.
+    #[test]
+    fn a_refused_rent_says_why_once_and_whose_node_cant_pay() {
+        let unreachable = json!({"error": "Your wallet can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive): nothing was paid.",
+                                 "unreachable": true, "probe": "a payment to this node found no route 12 s ago, with its invoice's route hints"});
+        let w = not_started("Not rented", &unreachable);
+        assert!(w.ends_with("none that can receive): nothing was paid.") && !w.ends_with(".."), "{w}");
+        let short = json!({"error": "Your wallet can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive): nothing was paid.",
+                           "unreachable": true, "probe": "the wallet's channels can't send 546000 msat"});
+        let w = not_started("Not started", &short);
+        assert!(w.starts_with("Not started: your Lightning node can't send the first payment right now. Nothing was paid.")
+                && w.contains("Settings → Your node") && !w.contains("seller") && !w.contains("msat"), "{w}");
+        assert_eq!(not_started("Not rented", &json!({"error": "the budget is less than one slice"})), "Not rented: the budget is less than one slice.");
+        assert_eq!(not_started("Not rented", &json!({})), "Not rented.");
+    }
+
+    /// A rental that ended on a payment that didn't go out, or on the rules' budget, says where that is fixed; the others
+    /// add nothing.
+    #[test]
+    fn an_ended_rental_says_where_to_fix_what_is_this_boxs() {
+        for why in ["the first slice could not be paid", "hashmaker closed: no first payment", "hasher closed: unpaid"] {
+            assert!(ended_next_step(why).contains("href=\"./lightning\""), "{why}");
+        }
+        assert!(ended_next_step("the task's budget in the wallet's rules is used up").contains("href=\"./policy\""));
+        for why in ["rental time over", "cut by the hashtaker", "hashmaker closed: no miners free now", "link lost: eof"] {
+            assert_eq!(ended_next_step(why), "", "{why}");
+        }
     }
 
     /// The rentals the page shows again: live while one hashes or connects, not once every one ended (its last look
