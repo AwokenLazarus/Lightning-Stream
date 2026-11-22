@@ -1157,10 +1157,27 @@ impl App {
             else { format!("{} service{} from {} seller{}: {}.", services.len(), if services.len() == 1 { "" } else { "s" }, sellers,
                            if sellers == 1 { "" } else { "s" }, cats.join(", ")) },
             if human && ready { " primary" } else { "" }));
-        if self.cfg.sell {
-            let (class, headline, next) = self.sell_summary();
-            b.push_str(&format!("<div class=\"card choice-card\"><h2>Sell a service</h2><p><span class=\"pill {class}\">{}</span></p><p>{}</p>\
-                <p><a class=\"button-link\" href=\"./sell\">Open Sell</a></p></div>", esc(&headline), esc(&next)));
+        // what this box sells: its shop's services, and its miners when it rents them out. A box that only rents
+        // out miners said "Not selling yet" here while its offer was listed (issue #75), so each is said by itself
+        let renting = self.hashrate_summary();
+        if self.cfg.sell || renting.is_some() {
+            let mut rows = String::new();
+            // a shop with nothing in it is not news beside miners that are rented out
+            if self.cfg.sell && !(renting.is_some() && self.shop().offers.is_empty()) {
+                let (class, headline, next) = self.sell_summary();
+                rows.push_str(&format!("<p><span class=\"pill {class}\">{}</span></p><p>{}</p>", esc(&headline), esc(&next)));
+            }
+            if let Some((class, headline, next)) = &renting {
+                // "below" is Sell → Hashrate's own page
+                let next = next.replace(" below.", " on the Hashrate page.");
+                rows.push_str(&format!("<p><span class=\"pill {class}\">{}</span></p><p>{}</p>", esc(headline), esc(&next)));
+            }
+            let links = match (self.cfg.sell, renting.is_some()) {
+                (true, true) => "<a class=\"button-link\" href=\"./sell\">Open Sell</a> <a class=\"button-link\" href=\"./sell-hashrate\">Hashrate</a>",
+                (false, true) => "<a class=\"button-link\" href=\"./sell-hashrate\">Open Hashrate</a>",
+                _ => "<a class=\"button-link\" href=\"./sell\">Open Sell</a>",
+            };
+            b.push_str(&format!("<div class=\"card choice-card\"><h2>Sell a service</h2>{rows}<p>{links}</p></div>"));
         }
         b.push_str("</section>");
         let line = if ready {
@@ -1170,7 +1187,7 @@ impl App {
         } else if ack {
             "<span class=\"pill warn\">One last step</span> Confirm that the app may pay with real money. <a href=\"./lightning#ack\">Start paying</a>".into()
         } else if connected {
-            "<span class=\"pill warn\">Not ready</span> Your Lightning node is connected but cannot pay yet. <a href=\"./lightning\">See why</a>".into()
+            "<span class=\"pill warn\">Can't pay yet</span> Your Lightning node is connected but cannot pay for services yet. Selling does not need this. <a href=\"./lightning\">See why</a>".into()
         } else {
             "<span class=\"pill warn\">Not connected</span> Connect your Lightning node to pay for services. <a href=\"./lightning\">Connect it</a>".into()
         };
@@ -1272,7 +1289,7 @@ impl App {
         let ready = ln["ready"] == true && ln["real_money_ack_needed"] != true;
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
         b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
-                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() })]));
+                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Can't pay yet</span> <a href=\"./lightning\">See why</a>".into() })]));
         // the simple view: what can be spent, favorite shops, and where to go; the coins on chain and the rest are behind Advanced
         if self.simple() {
             b.push_str("<p class=\"small\">This is what you can spend in shops right now, within your <a href=\"./limits\">limits</a>.</p></div></section>");

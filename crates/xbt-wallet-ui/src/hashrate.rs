@@ -606,6 +606,14 @@ pub(crate) fn write_settings(path: &std::path::Path, v: &Value) -> Result<(), St
 }
 
 impl App {
+    /// For Home: the hashmaker's state in a pill and a sentence, the same words as Sell → Hashrate's
+    /// own status; None when this box doesn't rent out miners.
+    pub(crate) fn hashrate_summary(&self) -> Option<(&'static str, String, String)> {
+        let base = self.cfg.hash.hasher.as_ref()?;
+        let st = call(base, &self.cfg.hash.hasher_token, "GET", "/status", None);
+        Some(renting_state(&st, &self.hash_settings()))
+    }
+
     pub(crate) fn hash_settings(&self) -> Value {
         std::fs::read_to_string(&self.cfg.hash.settings).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}))
     }
@@ -782,16 +790,7 @@ impl App {
         let fallback = pick("fallback").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
         let miners: Vec<Value> = st.as_ref().ok().and_then(|s| s["miners"].as_array().cloned()).unwrap_or_default();
         let rentals: Vec<Value> = st.as_ref().ok().and_then(|s| s["rentals"].as_array().cloned()).unwrap_or_default();
-        let live = miners.iter().filter(|m| m["connected"] == true).count();
-        let rented = miners.iter().filter(|m| !m["rentedTo"].is_null()).count();
-        let (class, head, next) = match &st {
-            Err(e) => ("bad", "Can't reach the hashrate service".to_string(), e.clone()),
-            Ok(_) if !on || fallback.is_empty() => ("warn", "Not renting out".to_string(),
-                "Say where your miners hash when nobody rents them, then turn renting on below.".to_string()),
-            Ok(_) if live == 0 => ("warn", "Renting is on, no miners yet".to_string(), "Point your miners at the address below.".to_string()),
-            Ok(_) => ("good", format!("Renting out: {rented} of {live} miner{} rented", if live == 1 { "" } else { "s" }),
-                      if rented == 0 { "The others hash for your own pool until someone rents them.".into() } else { String::new() }),
-        };
+        let (class, head, next) = renting_state(&st, &saved);
         b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{}</p>{}</section>",
                             esc(&head), if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
 
@@ -2873,5 +2872,25 @@ mod tests {
                        "live": {"closed": "the task's budget in the wallet's rules is used up", "paidSlices": 40, "spentMsat": 2_040_000}});
         let card = rental_card(&ctx, &t, "hashrate");
         assert!(card.contains("<strong>Ended:</strong> the budget your spending rules give hashrate rentals was spent.") && !card.contains("20,202 sats)"), "{card}");
+    }
+}
+
+/// The hashmaker's state as (pill class, headline, next step), from its `/status` and the saved
+/// settings (which win over what the hashmaker last read). Sell → Hashrate and Home both say this.
+pub(crate) fn renting_state(st: &Result<Value, String>, saved: &Value) -> (&'static str, String, String) {
+    let settings = st.as_ref().ok().map(|s| s["settings"].clone()).unwrap_or(json!({}));
+    let pick = |k: &str| saved.get(k).filter(|v| !v.is_null()).cloned().or_else(|| settings.get(k).filter(|v| !v.is_null()).cloned());
+    let on = pick("enabled") == Some(Value::Bool(true));
+    let fallback = pick("fallback").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    let miners: Vec<Value> = st.as_ref().ok().and_then(|s| s["miners"].as_array().cloned()).unwrap_or_default();
+    let live = miners.iter().filter(|m| m["connected"] == true).count();
+    let rented = miners.iter().filter(|m| !m["rentedTo"].is_null()).count();
+    match st {
+        Err(e) => ("bad", "Can't reach the hashrate service".to_string(), e.clone()),
+        Ok(_) if !on || fallback.is_empty() => ("warn", "Not renting out".to_string(),
+            "Say where your miners hash when nobody rents them, then turn renting on below.".to_string()),
+        Ok(_) if live == 0 => ("warn", "Renting is on, no miners yet".to_string(), "Point your miners at the address below.".to_string()),
+        Ok(_) => ("good", format!("Renting out: {rented} of {live} miner{} rented", if live == 1 { "" } else { "s" }),
+                  if rented == 0 { "The others hash for your own pool until someone rents them.".into() } else { String::new() }),
     }
 }
