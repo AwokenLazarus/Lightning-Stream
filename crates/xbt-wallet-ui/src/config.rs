@@ -43,7 +43,8 @@
 //! | `XBT_UI_APP_PORTS` | | ports (comma-separated) a seller's own web page is served on, one origin each, when the owner opens it inside the app (docs/SELLER-APPS.md); empty: off. The browser must reach them on the same host as this page |
 //! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password. Set it only where no other app can take that name on the network: umbrelOS 2.0 runs no app-proxy container, so the Umbrel package leaves it unset |
 //! | `XBT_UI_ENROLL_CODE_FILE` | | the signer's one-time enrolment code, where the signer writes a copy for the UI (`B2_ENROLL_CODE_COPY`): the setup page fills it in, so the owner reads no log |
-//! | `XBT_UI_SETUP_CODE_HINT` | | where the owner finds the first run's setup code on this platform (Umbrel: Troubleshoot; StartOS: the action), said on the first page instead of the general words |
+//! | `XBT_UI_NODE_LOGIN_HINT` | | where the owner corrects the app's login to the XBT node on this platform, said when the node refuses it (Linux: the `LS_NODE_RPC_USER` and `LS_NODE_RPC_PASS` lines in `.env`; Umbrel and StartOS: where the platform sets it) |
+| `XBT_UI_SETUP_CODE_HINT` | | where the owner finds the first run's setup code on this platform (Umbrel: Troubleshoot; StartOS: the action), said on the first page instead of the general words |
 //! | `XBT_UI_LN_CONNECT_ADDRESS` | | where the owner copies the node's connection address on this platform (StartOS without Lightning Fork's grant: its REST LND Connect interface). Set, Your node walks the owner through pasting it, and the app makes its own narrow keys from it once, keeping neither the address nor its key |
 //! | `XBT_UI_RESTART_HINT` | restart Lightning Stream from your Umbrel or StartOS dashboard | how the owner restarts the app on this platform, said where a signed change waits for a restart |
 //! | `XBT_UI_LOCAL_SERVICES` | | services on this box the Sell page offers, `Name=http://host:port`, comma-separated, beside the ones it finds by their usual names |
@@ -76,6 +77,8 @@ use std::time::Duration;
 
 /// How the owner restarts the app where the platform does not say (`XBT_UI_RESTART_HINT`).
 pub const RESTART_HINT: &str = "restart Lightning Stream from your Umbrel or StartOS dashboard";
+/// Where the node's login is corrected where the platform does not say (`XBT_UI_NODE_LOGIN_HINT`).
+pub const NODE_LOGIN_HINT: &str = "Set the app's user name and password for the node to the ones the node uses, then restart the app.";
 
 /// How long the signer's slow-changing reads serve later pages by default (`XBT_UI_CACHE_S`). 0.2.2
 /// kept them 3 s, less than the time between two pages, so a page never found one kept ("2 calls,
@@ -157,6 +160,8 @@ pub struct Config {
     pub enroll_code_file: Option<PathBuf>,
     /// `XBT_UI_RESTART_HINT`: how the owner restarts the app on this platform.
     pub restart_hint: String,
+    /// `XBT_UI_NODE_LOGIN_HINT`: where the owner corrects the app's login to the XBT node on this platform.
+    pub node_login_hint: String,
     /// `XBT_UI_SETUP_CODE_HINT`: where the setup code is on this platform; `None`: the general words.
     pub setup_code_hint: Option<String>,
     /// `XBT_UI_LOCAL_SERVICES`: services on this box to offer on the Sell page, (name, address).
@@ -468,6 +473,7 @@ impl Config {
             platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
             enroll_code_file: env("XBT_UI_ENROLL_CODE_FILE").map(PathBuf::from),
             restart_hint: env("XBT_UI_RESTART_HINT").map(|h| h.chars().take(300).collect()).unwrap_or_else(|| RESTART_HINT.into()),
+            node_login_hint: env("XBT_UI_NODE_LOGIN_HINT").map(|h| h.chars().take(400).collect()).unwrap_or_else(|| NODE_LOGIN_HINT.into()),
             setup_code_hint: env("XBT_UI_SETUP_CODE_HINT").map(|h| h.chars().take(300).collect()),
             local_services: env("XBT_UI_LOCAL_SERVICES").map(|v| v.split(',').filter_map(|e| {
                 let (n, u) = e.split_once('=')?;
@@ -542,7 +548,7 @@ impl Config {
                files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), prefetch: false, relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], funding_peer: None, platform_login: None, enroll_code_file: None,
-               restart_hint: RESTART_HINT.into(), setup_code_hint: None, local_services: vec![],
+               restart_hint: RESTART_HINT.into(), node_login_hint: NODE_LOGIN_HINT.into(), setup_code_hint: None, local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
                vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None, tunnel_upstream: None },

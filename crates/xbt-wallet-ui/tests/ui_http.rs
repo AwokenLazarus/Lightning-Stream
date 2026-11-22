@@ -3527,6 +3527,15 @@ fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive(
     assert!(p.contains("<li class=\"now\" aria-current=\"step\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 30 sats, less than a hashtaker's smallest payment (546 sats). \
                         To make room, ask another node to open a channel to you"), "{p}");
     assert!(p.contains("3 of 6 done"), "{p}");
+    // the node stops answering the app's login: the first line says the node runs and refused it, and where to fix it
+    // (the default words here: no platform said otherwise), never a user name or password
+    bx.rig.chain.st.lock().unwrap().login_refused = true;
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your XBT node answers</strong>")
+            && list.contains("Your XBT node is running, but it refused the app's user name or password"), "{list}");
+    assert!(!list.contains("cannot connect") && !list.contains("401"), "{list}");
 }
 
 /// says why in plain words; the address is set, and cleared, on the page.
@@ -6744,4 +6753,75 @@ fn the_suggested_node_on_mainnet_is_one_the_signer_takes() {
     // both, as the page fills them in: tried in order on one approval
     assert_eq!(xbt_signer::ln_open::hosts(&format!("{GENESIS_HOST},{GENESIS_ONION}")).map(|h| h.len()), Some(2));
     assert!(xbt_wallet_ui::config::funding_peer(&format!("{GENESIS_NODE}@{GENESIS_HOST},{GENESIS_ONION}")).is_some());
+}
+
+/// An XBT node that is running and refuses the app's login is said so on every page that waits for the node: the
+/// gateway card and the wallet's flash, and not as a node that is away or still catching up. The platform's own words
+/// say where to fix it, and no user name, password or cookie is ever on a page.
+#[test]
+fn a_node_that_refuses_the_apps_login_is_said_so_apart_from_one_that_is_away() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "127.0.0.1:23339", "reachable": false, "found": []},
+            "bundled": {"addr": "127.0.0.1:23339", "inUse": true, "running": true, "node": false, "masking": false, "state": "waiting for the node"},
+            "blinding": {"state": "can't be checked", "why": "127.0.0.1:23339 doesn't answer"}, "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    // a cookie in the run folder with a user and password that must never come out on a page
+    std::fs::write(gwdir.join("rpc.cookie"), "owner-user:owner-secret-pass").unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+        c.node_login_hint = "Open the .env file, set the LS_NODE_RPC_USER and LS_NODE_RPC_PASS lines, then run docker compose up -d.".into();
+    });
+    let st = xbt_wallet_ui::config::StreamGwSetup { rpcurl: Some("http://node:18443".into()), dir: gwdir.clone(), ..Default::default() };
+    xbt_wallet_ui::stream_gateway::write(&st, &xbt_wallet_ui::stream_gateway::Settings::new(xbt_wallet_ui::stream_gateway::Mode::Solo,
+                                         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"), "regtest").unwrap();
+    let mut br = logged_in(&bx);
+    let pages = |br: &mut B| (unescape(&br.get("/hashrate").body), unescape(&br.get("/wallet").body));
+
+    // the node answers 401: running, login refused
+    bx.rig.chain.st.lock().unwrap().login_refused = true;
+    let (hash, wallet) = pages(&mut br);
+    for (what, page) in [("the gateway card", &hash), ("the wallet page", &wallet)] {
+        assert!(page.contains("Your XBT node is running, but it refused the app's user name or password"), "{what}: {page}");
+        assert!(page.contains("LS_NODE_RPC_USER and LS_NODE_RPC_PASS lines, then run docker compose up -d"), "{what}: {page}");
+        assert!(!page.contains("cannot connect") && !page.contains("401") && !page.contains("owner-secret-pass") && !page.contains("owner-user"), "{what}: {page}");
+    }
+    assert!(hash.contains("Your gateway is waiting for your node") && !hash.contains("Check that the node is running and synced"), "{hash}");
+
+    // the node is not there: other words
+    {
+        let mut c = bx.rig.chain.st.lock().unwrap();
+        c.login_refused = false;
+        c.down = true;
+    }
+    let (hash, wallet) = pages(&mut br);
+    for (what, page) in [("the gateway card", &hash), ("the wallet page", &wallet)] {
+        assert!(page.contains("The app cannot connect to your XBT node. Either the node is not running"), "{what}: {page}");
+        assert!(!page.contains("refused the app"), "{what}: {page}");
+    }
+
+    // answering, and still catching up
+    {
+        let mut c = bx.rig.chain.st.lock().unwrap();
+        c.down = false;
+        c.syncing = true;
+    }
+    let (hash, _) = pages(&mut br);
+    assert!(hash.contains("still catching up with the network") && !hash.contains("refused the app") && !hash.contains("cannot connect"), "{hash}");
+
+    // a healthy node: the card's older words, and no flash on the wallet page
+    bx.rig.chain.st.lock().unwrap().syncing = false;
+    let (hash, wallet) = pages(&mut br);
+    assert!(hash.contains("has no work from your XBT node yet. Check that the node is running and synced."), "{hash}");
+    assert!(!wallet.contains("The amounts on it below may be out of date"), "{wallet}");
 }

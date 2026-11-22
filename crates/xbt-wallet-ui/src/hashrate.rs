@@ -1032,7 +1032,10 @@ impl App {
     /// when someone else's rental has delivered and paid, and until then it says how to get one. Once every line
     /// is done it is one line, so it does not crowd a box that is renting.
     fn rent_checklist(&self, st: &Result<Value, String>, on: bool, fallback: &str, live: usize) -> String {
-        let node = self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == true);
+        let node_said = self.call("node_status", json!({}));
+        let trouble = crate::node_words::trouble(&node_said);
+        // answering and caught up: a node still syncing answers, but has no work to give yet
+        let node = node_said.as_ref().is_ok_and(|n| n["reachable"] == true) && trouble.is_none();
         // hashtakers pay through the shop, so its keys to the node are what make this box payable
         let connected = self.keys_stored();
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
@@ -1046,7 +1049,8 @@ impl App {
         let steps: Vec<(bool, &str, String, &str, &str)> = vec![
             (node, "Your XBT node answers",
              if node { "The app reaches your XBT node.".into() } else {
-                 "The app cannot reach your XBT node. Check that it is running and that the app has its address and password (on Linux: in .env).".into()
+                 trouble.map(|t| crate::node_words::words(t, &self.cfg.node_login_hint))
+                     .unwrap_or_else(|| "The app cannot get an answer from your XBT node. Check that it is running.".into())
              }, "", ""),
             (connected, "Your Lightning node is connected",
              if connected { "Hashtakers pay you through it.".into() } else { "Hashtakers pay you through your Lightning node. Connect it on Sell.".into() },
@@ -1261,7 +1265,7 @@ impl App {
         // renting needs a gateway that hides which shares win: checked from its jobs when this page loads, whatever pool
         let masked = st["blinding"]["state"] == "blinded";
         let ready = reachable && masked;
-        let (class, head, next) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some());
+        let (class, head, next) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some(), &|| self.node_trouble_words());
         // the signed spending rules: a rental is paid with stream tickets, under their hashrate task (0.2.11 said "Ready to rent"
         // on rules signed before that task, and every rental's first payment was refused). Unread, nothing is said here.
         let rules = self.call("policy_get", json!({})).map(|v| rent_rules(&v["policy"])).unwrap_or(RentRules::Allowed);
@@ -1658,7 +1662,9 @@ fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool,
     why
 }
 
-fn rent_status(st: &Value, here: bool, set_up: bool) -> (&'static str, &'static str, String) {
+/// `node_trouble`: why the XBT node is not giving work, asked only when the gateway is waiting for it, in the words every
+/// page uses ([`crate::node_words`]): a node that refused the app's login is said so, not "check that it is running".
+fn rent_status(st: &Value, here: bool, set_up: bool, node_trouble: &dyn Fn() -> Option<String>) -> (&'static str, &'static str, String) {
     use crate::stream_gateway::NAME;
     let datum = st["datum"]["addr"].as_str().unwrap_or("");
     let reachable = st["datum"]["reachable"] == true;
@@ -1688,8 +1694,8 @@ fn rent_status(st: &Value, here: bool, set_up: bool) -> (&'static str, &'static 
     }
     if on_bundled && (b["node"] != true || bstate == "waiting for the node") {
         return ("warn", "Your gateway is waiting for your node",
-                format!("The {NAME} runs, but it has no work from your XBT node yet. Check that the node is running and synced. Renting stays off \
-                    until then, and nothing is paid."));
+                format!("The {NAME} runs, but it has no work from your XBT node yet. {} Renting stays off until then, and nothing is paid.",
+                        node_trouble().unwrap_or_else(|| "Check that the node is running and synced.".into())));
     }
     if datum.is_empty() {
         return ("warn", "No gateway yet", "Rented work goes to your own gateway, which builds the blocks. Set its address below.".into());
@@ -1832,7 +1838,7 @@ impl App {
         };
         // the Hashrate page's own heading for it (its words after say "below", for the settings there); renting itself
         // waits on the spending rules too, said on that page
-        let (class, head, _) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some());
+        let (class, head, _) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some(), &|| self.node_trouble_words());
         let head = if class == "good" { "Your gateway is ready" } else { head };
         let mut b = format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p></section>");
         b.push_str(&format!("<section class=\"card\" id=\"gateway\">{}\

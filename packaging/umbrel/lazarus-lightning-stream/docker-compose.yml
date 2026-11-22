@@ -217,6 +217,8 @@ services:
       XBT_UI_SUGGESTED_SELLERS: npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a
       # the built-in Stream relay needs this box's public port 443, which an Umbrel app can't take
       XBT_UI_RELAY_UNAVAILABLE: "an Umbrel app can't take this box's port 443, which a relay needs. Run one with the Linux package on a server with a public address (see the setup guide)."
+      # Umbrel passes the node app's login to this app; there is nothing to type
+      XBT_UI_NODE_LOGIN_HINT: "Umbrel sets this login for you, so there is nothing to type. Restart your XBT node app, then restart Lightning Stream (right-click its icon, then Restart)."
       XBT_UI_RESTART_HINT: restart Lightning Stream from your Umbrel (right-click its icon, then Restart)
       # the first page's setup code: where Umbrel shows it (its log), in Umbrel's words only
       XBT_UI_SETUP_CODE_HINT: "On Umbrel: right-click the Lightning Stream icon and choose Troubleshoot; the code is on the line that says setup code."

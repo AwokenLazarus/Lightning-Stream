@@ -425,6 +425,12 @@ impl App {
         self.signer.call(method, params)
     }
 
+    /// Why the XBT node is not giving the app what it needs, in the one set of words every page uses
+    /// ([`crate::node_words`]); `None` when it is fine or the signer did not say.
+    pub(crate) fn node_trouble_words(&self) -> Option<String> {
+        crate::node_words::trouble(&self.call("node_status", json!({}))).map(|t| crate::node_words::words(t, &self.cfg.node_login_hint))
+    }
+
     pub(crate) fn cookie(&self, req: &Req, sid: &str, max_age: i64) -> String {
         let secure = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         format!("{COOKIE}={sid}; Path={}; HttpOnly; SameSite=Strict; Max-Age={max_age}{}", self.cfg.base_path, if secure { "; Secure" } else { "" })
@@ -1282,10 +1288,8 @@ impl App {
             b.push_str("<div class=\"flash warn\">This box holds more than you allowed: <a href=\"./keys\">move the extra to your own wallet</a>.</div>");
         }
         // the signer runs without the XBT node, and the amounts on it wait for it
-        if self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == false) {
-            b.push_str("<div class=\"flash warn\">The app cannot reach your XBT node yet, so the amounts on it below may be out of date. \
-                        Paying over Lightning does not need it. Check that the node is running and that the app has its address and \
-                        password (on Linux: LS_NODE_RPC_* in .env).</div>");
+        if let Some(why) = self.node_trouble_words() {
+            b.push_str(&format!("<div class=\"flash warn\">{} The amounts on it below may be out of date. Paying over Lightning does not need it.</div>", esc(&why)));
         }
         // Lightning first: what pays for services. The XBT node's on-chain coins are another wallet, said apart
         // (0.2.1 showed "On your node 0 sats" while the channels held 286,000)

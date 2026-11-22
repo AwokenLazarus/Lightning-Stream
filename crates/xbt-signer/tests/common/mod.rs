@@ -33,6 +33,10 @@ pub struct State {
     pub reject: Option<String>,
     pub mined_by_signer: u64,
     pub down: bool,
+    /// The node is up and answers HTTP 401 to every call: the app's user name or password is wrong.
+    pub login_refused: bool,
+    /// `getblockchaininfo` says `initialblockdownload`: the node answers and is still catching up.
+    pub syncing: bool,
     /// `getblockchaininfo`'s difficulty; None: 6.33e9, as on mainnet when the hashmaker's price was set.
     pub difficulty: Option<f64>,
     /// `getblockstats`'s subsidy; None: 3.125 XBT. `Some(None)`: the node does not answer it.
@@ -239,6 +243,9 @@ impl Node for FakeChain {
             if s.down {
                 return Err(rpc_err("connection refused"));
             }
+            if s.login_refused {
+                return Err(ChannelError::new(xbt_signer::node::LOGIN_REFUSED, "the node refused the app's login (HTTP 401)".to_string()));
+            }
             if method == "getblockcount" && s.height_fails_every > 0 {
                 s.height_asked += 1;
                 if s.height_asked.is_multiple_of(s.height_fails_every) {
@@ -251,7 +258,7 @@ impl Node for FakeChain {
             "getblockchaininfo" => {
                 let s = self.st.lock().unwrap();
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                json!({"chain": s.chain, "blocks": s.height, "headers": s.height, "initialblockdownload": false, "pruned": true,
+                json!({"chain": s.chain, "blocks": s.height, "headers": s.height, "initialblockdownload": s.syncing, "pruned": true,
                        "difficulty": s.difficulty.unwrap_or(6.33e9), "time": now})
             }
             "getblockstats" => match self.st.lock().unwrap().subsidy {

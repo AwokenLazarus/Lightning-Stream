@@ -169,3 +169,27 @@ fn a_pruned_regtest_node_gives_the_regtest_schedule() {
     let t = rig.call("mining_tip", json!({}));
     assert_eq!((t["subsidySats"].as_u64(), t["subsidyFrom"].as_str()), (Some(78_125_000), Some("schedule")), "{t}");
 }
+
+/// A node that is up and refuses the app's login is not "away": `node_status` says so (`problem`), and a node still
+/// catching up is said apart.
+#[test]
+fn node_status_tells_a_refused_login_from_a_node_that_is_away_and_one_still_syncing() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    env_for(d.path());
+    let root = root_with(d.path(), &runbook_policy(json!({})));
+    let chain = FakeChain::new("regtest", 6_720);
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ..Default::default() }).unwrap();
+    let n = call(&s, "node_status", json!({}));
+    assert_eq!((n["reachable"].as_bool(), n["syncing"].as_bool()), (Some(true), Some(false)), "{n}");
+    chain.st.lock().unwrap().syncing = true;
+    assert_eq!(call(&s, "node_status", json!({}))["syncing"], true);
+    chain.st.lock().unwrap().syncing = false;
+    chain.st.lock().unwrap().login_refused = true;
+    let n = call(&s, "node_status", json!({}));
+    assert_eq!((n["reachable"].as_bool(), n["problem"].as_str()), (Some(false), Some("login_refused")), "{n}");
+    chain.st.lock().unwrap().login_refused = false;
+    chain.st.lock().unwrap().down = true;
+    let n = call(&s, "node_status", json!({}));
+    assert_eq!((n["reachable"].as_bool(), n["problem"].as_str()), (Some(false), Some("no_connection")), "{n}");
+}
