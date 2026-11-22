@@ -3349,6 +3349,117 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
     assert!(p.body.contains(OFF) && !p.body.contains(ON), "saved off: {}", p.body);
 }
 
+/// The Lightning node a seller is paid through, in memory: its channels, as LND lists them, and nothing else.
+struct ChannelsLn(std::sync::Mutex<Vec<Value>>);
+impl xbt_signer::ln::LnBackend for ChannelsLn {
+    fn get_info(&self) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn block_hash(&self, _: i64) -> xbt402::Result<String> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn decode(&self, _: &str) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn channels(&self) -> xbt402::Result<Vec<Value>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn send(&self, _: &xbt_signer::ln::SendRequest) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn lookup(&self, _: &str) -> xbt402::Result<Option<Value>> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn utxos(&self) -> xbt402::Result<Vec<Value>> {
+        Ok(vec![])
+    }
+    fn describe(&self) -> String {
+        "in-memory node".into()
+    }
+}
+
+/// What the hashmaker's /status says in the checklist test: 0 before anything is set up, 1 once it all is.
+static RENT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sell → Hashrate's checklist: each thing renting out needs, in order, done or with its one next step; how much
+/// the node can be paid, and when nothing, why and what to do in plain words; one line once all is done.
+///
+/// FAILS before: no checklist, and nothing said the box could not be paid until a rental failed.
+#[test]
+fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") if RENT_READY.load(std::sync::atomic::Ordering::SeqCst) => json!({"open": true,
+            "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
+            "minersAddress": "umbrel.local:23340", "rentals": [],
+            "miners": [{"name": "S19", "connected": true, "hashrateHs": 1.0e14, "earnedMsat": 0, "rentedTo": null}],
+            "listing": {"ok": true, "miners": 1, "freeMiners": 1}}),
+        ("GET", "/status") => json!({"open": false, "settings": {"enabled": false, "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
+                                      "minersAddress": "umbrel.local:23340", "miners": [], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    // one channel, all of it on this side: nothing can come in
+    let ln = Arc::new(ChannelsLn(std::sync::Mutex::new(vec![
+        json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "99000", "remote_balance": "0"})])));
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln: Some(ln.clone()), ..Default::default() }).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let htok = side.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let gw = side.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let (gw2, settings) = (gw.clone(), side.path().join("hashrate/settings.json"));
+    let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| {
+        c.sell = true;
+        c.gw.dir = gw2;
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher);
+        c.hash.hasher_token = Some(htok);
+        c.hash.settings = settings;
+    });
+    let mut br = logged_in(&bx);
+
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(p.find("id=\"rent-checklist\"").unwrap() < p.find("id=\"rent-form\"").unwrap(), "near the top, before the form");
+    assert!(list.contains("Before you rent out") && list.contains("1 of 5 done"), "{list}");
+    // in order, the XBT node done, the Lightning node the step to do now, with its one button
+    let at = |s: &str| list.find(s).unwrap_or_else(|| panic!("{s} missing: {list}"));
+    assert!(at("Your XBT node answers") < at("Your Lightning node is connected") && at("Your Lightning node is connected") < at("You can receive payments")
+            && at("You can receive payments") < at("Your miners are connected") && at("Your miners are connected") < at("Your offer is listed"), "{list}");
+    assert!(list.contains("<li class=\"done\"><strong>Your XBT node answers</strong>"), "{list}");
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node is connected</strong>") && list.contains("href=\"./sell\">Connect it</a>"), "{list}");
+    assert_eq!(list.matches("button-link").count(), 1, "one button, on the step to do now: {list}");
+    // nothing can come in: said, with why and the ways to fix it, without jargon
+    assert!(list.contains("Can receive about 0 sats.") && list.contains("ask another node to open a channel to you")
+            && list.contains("open a channel yourself and spend some of it"), "{list}");
+    for j in ["inbound", "liquidity", "remote balance", "reserve", "msat", "htlc"] {
+        assert!(!list.to_lowercase().contains(j), "\"{j}\" in the checklist: {list}");
+    }
+    assert!(list.contains("Say where your miners hash when nobody rents them") && list.contains("Turn renting on in the form below"), "{list}");
+    assert!(!p.contains("Ready to be rented"));
+
+    // all done: the shop's keys to the node, room to be paid, a pool and a miner, the offer listed
+    std::fs::write(gw.join("invoices.macaroon"), "00").unwrap();
+    std::fs::write(gw.join("info.macaroon"), "00").unwrap();
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "39000", "remote_balance": "60000",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    RENT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    let p = br.get("/sell-hashrate").body;
+    assert!(p.contains("<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span></p>"), "{p}");
+    assert!(!p.contains("Before you rent out"), "{p}");
+    // with some room, the line says how much (the box not yet otherwise ready, so the list is shown)
+    RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains("<li class=\"done\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 59,000 sats.</span>"), "{p}");
+    assert!(p.contains("3 of 5 done"), "{p}");
+}
+
 /// says why in plain words; the address is set, and cleared, on the page.
 #[test]
 fn hashrate_without_a_public_address_is_not_listed_and_says_why() {

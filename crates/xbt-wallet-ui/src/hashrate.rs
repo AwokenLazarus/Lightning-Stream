@@ -446,6 +446,19 @@ fn sats_n(n: f64) -> String {
     format!("{o} {}", if n == 1 { "sat" } else { "sats" })
 }
 
+/// The checklist's line on being paid: how much the node can receive, and when that is nothing, why and
+/// what to do, in plain words. A seller cannot be paid without room on the other side of a channel, and
+/// this took sellers the most help to sort out.
+fn receive_words(receivable: Option<i64>) -> String {
+    match receivable {
+        None => "The app cannot see your channels yet. Connect your node on Your node to see how much you can receive.".into(),
+        Some(0) => "Can receive about 0 sats. Hashtakers pay you through your channels, and none of them has room for a payment to come in. \
+                    To make room, ask another node to open a channel to you, or open a channel yourself and spend some of it. \
+                    What you spend moves to the other side, and that much can then come back to you.".into(),
+        Some(n) => format!("Can receive about {}.", sats_n(n as f64)),
+    }
+}
+
 /// Whether a hashmaker could drop the shares that win on this upstream, as its jobs show. Nothing here names a pool:
 /// a pool that adds a key shows as blinded by itself.
 fn blinding_card(b: &Value) -> String {
@@ -793,11 +806,12 @@ impl App {
         let (class, head, next) = renting_state(&st, &saved);
         b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{}</p>{}</section>",
                             esc(&head), if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
+        b.push_str(&self.rent_checklist(&st, on, &fallback, live));
 
         // where the miners point, once
         let addr = st.as_ref().ok().and_then(|s| s["minersAddress"].as_str().map(str::to_string)).unwrap_or_default();
         if !addr.is_empty() {
-            b.push_str(&format!("<section class=\"card\"><h2>Point your miners at this box</h2>\
+            b.push_str(&format!("<section class=\"card\" id=\"point-miners\"><h2>Point your miners at this box</h2>\
                 <p>In each miner's settings, set its first pool to this address. Keep its worker name and password as they are.</p>\
                 <label>Pool address for your miners<input id=\"miners-address\" readonly class=\"mono\" value=\"stratum+tcp://{}\"></label>\
                 <div class=\"row\"><button type=\"button\" class=\"secondary\" data-copy=\"miners-address\">Copy the address</button></div>\
@@ -888,7 +902,7 @@ impl App {
         } else {
             forwarded.clone()
         };
-        b.push_str(&format!("<section class=\"card primary\"><h2>{}</h2><form method=\"post\" action=\"./sell-hashrate\">{csrf}\
+        b.push_str(&format!("<section class=\"card primary\" id=\"rent-form\"><h2>{}</h2><form method=\"post\" action=\"./sell-hashrate\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"save\">\
             <label>Your own pool, where your miners hash when nobody rents them<input name=\"fallback\" value=\"{}\" required class=\"mono\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\" placeholder=\"192.168.1.20:23334\"></label>\
@@ -932,6 +946,60 @@ impl App {
             }
         }
         self.html_page("Sell hashrate", "Sell hashrate", ctx, &b, "")
+    }
+
+    /// What renting out needs, in order, as Home's First steps shows its own: each line done or not, with
+    /// its one next step, the first one left to do with its button. Sellers told us the pieces were spread
+    /// over several pages, and a box that could not be paid said so only when a rental failed. Once every
+    /// line is done it is one line, so it does not crowd a box that is renting.
+    fn rent_checklist(&self, st: &Result<Value, String>, on: bool, fallback: &str, live: usize) -> String {
+        let node = self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == true);
+        // hashtakers pay through the shop, so its keys to the node are what make this box payable
+        let connected = self.keys_stored();
+        let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+        let receivable = crate::pay_feedback::receivable_sats(&ln);
+        let listing = st.as_ref().ok().map(|s| s["listing"].clone()).unwrap_or(Value::Null);
+        let listed = listing["ok"] == true;
+        // (done, title, the state or the one next step, where to go, its button)
+        let steps: Vec<(bool, &str, String, &str, &str)> = vec![
+            (node, "Your XBT node answers",
+             if node { "The app reaches your XBT node.".into() } else {
+                 "The app cannot reach your XBT node. Check that it is running and that the app has its address and password (on Linux: in .env).".into()
+             }, "", ""),
+            (connected, "Your Lightning node is connected",
+             if connected { "Hashtakers pay you through it.".into() } else { "Hashtakers pay you through your Lightning node. Connect it on Sell.".into() },
+             "./sell", "Connect it"),
+            (receivable.is_some_and(|r| r > 0), "You can receive payments", receive_words(receivable), "./lightning", "Your node and channels"),
+            (!fallback.is_empty() && live > 0, "Your miners are connected",
+             if fallback.is_empty() {
+                 "Say where your miners hash when nobody rents them, in the form below.".into()
+             } else if live == 0 {
+                 "Point at least one miner at this box, at the address below.".into()
+             } else {
+                 format!("{live} miner{} connected. Any miner nobody rents hashes for your own pool.", if live == 1 { " is" } else { "s are" })
+             }, if fallback.is_empty() { "#rent-form" } else { "#point-miners" }, if fallback.is_empty() { "Set your own pool" } else { "See the address" }),
+            (listed, "Your offer is listed",
+             if listed { "Hashtakers can find it on public listings.".into() }
+             else if !on { "Turn renting on in the form below, then save.".into() }
+             else { listing["why"].as_str().unwrap_or("Your offer goes on public listings once a miner is connected.").to_string() },
+             "#rent-form", "Rent out your miners"),
+        ];
+        let done = steps.iter().filter(|s| s.0).count();
+        if done == steps.len() {
+            return "<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span></p>".into();
+        }
+        let next = steps.iter().position(|s| !s.0).unwrap_or(0);
+        let mut b = format!("<section class=\"card\" id=\"rent-checklist\"><h2>Before you rent out</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+                            steps.len());
+        for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
+            // a step with nowhere to go (the XBT node is set up outside the app) says what to check, with no button
+            let action = if i == next && !href.is_empty() { format!("<p><a class=\"button-link primary\" href=\"{href}\">{}</a></p>", esc(button)) } else { String::new() };
+            b.push_str(&format!("<li class=\"{}\"{}><strong>{}</strong> <span class=\"small\">{}</span>{action}</li>",
+                                if *ok { "done" } else if i == next { "now" } else { "" }, if i == next { " aria-current=\"step\"" } else { "" },
+                                esc(title), esc(what)));
+        }
+        b.push_str("</ol></section>");
+        b
     }
 
     pub(crate) fn sell_hashrate_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
