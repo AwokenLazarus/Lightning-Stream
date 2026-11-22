@@ -307,6 +307,25 @@ fn sessions_expire_when_idle() {
 }
 
 #[test]
+fn the_backups_page_lists_what_to_save_and_is_linked_from_settings() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.password = Some("platform password".into()));
+    let mut br = logged_in(&bx);
+    let page = br.get("/backups");
+    assert_eq!(page.status, 200);
+    for want in ["Backups and recovery", "Lightning Fork", "Your approval key", "The app password", "Your shop and listing keys", "The data folder",
+                 "set by your platform", "href=\"./keys\""] {
+        assert!(page.body.contains(want), "/backups lacks {want}");
+    }
+    assert!(!page.body.contains("href=\"/") && !page.body.contains("platform password"));
+    // linked from the settings tabs, and the page belongs to that section
+    for from in ["/keys", "/setup"] {
+        assert!(br.get(from).body.contains("href=\"./backups\""), "{from} does not link to /backups");
+    }
+    assert_eq!(B::new(&bx.base).get("/backups").location(), "./login");
+}
+
+#[test]
 fn behind_a_proxy_prefix_and_the_peer_allowlist() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let bx = start(json!({}), false, |c| {
@@ -890,7 +909,7 @@ fn no_secret_is_in_any_page_as_it_opens() {
     leaks("/login", &B::new(&bx.base).get("/login").body);
     let mut br = logged_in(&bx);
     for p in ["/", "/wallet", "/browse", "/services", "/sell", "/sell-hashrate", "/sell-vpn", "/hashrate", "/ai", "/vpn", "/nostr", "/relays",
-              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/agents", "/setup", "/lightning",
+              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/backups", "/agents", "/setup", "/lightning",
               "/your-gateway", "/api/pending", "/api/hashrate-rentals", "/sell?edit=app"] {
         let r = br.get(p);
         leaks(p, &format!("{} {:?}", r.body, r.headers));

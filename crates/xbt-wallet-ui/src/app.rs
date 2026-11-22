@@ -35,6 +35,8 @@ pub mod hashrate;
 pub(crate) mod inference_page;
 #[path = "vpn_page.rs"]
 pub(crate) mod vpn_page;
+#[path = "backups_page.rs"]
+mod backups_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -647,6 +649,7 @@ impl App {
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
+            "/backups" => self.backups_page(&ctx),
             "/agents" => self.agents(&ctx, false),
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),

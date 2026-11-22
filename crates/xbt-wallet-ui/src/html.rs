@@ -177,7 +177,8 @@ pub const APPS: Section = Section {
 pub const SETTINGS: Section = Section {
     label: "Settings",
     tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
-            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" }],
+            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
+            Tab { href: "./backups", title: "Backups", label: "Backups and recovery" }],
     also: &[],
     advanced: &[Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
                 Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
@@ -187,7 +188,8 @@ pub const SETTINGS_HASH: Section = Section {
     label: "Settings",
     tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
             Tab { href: "./your-gateway", title: "Your gateway", label: "Your gateway" },
-            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" }],
+            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
+            Tab { href: "./backups", title: "Backups", label: "Backups and recovery" }],
     also: &[],
     advanced: SETTINGS.advanced,
 };
