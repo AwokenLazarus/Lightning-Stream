@@ -897,9 +897,22 @@ pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<
         json!({"chan_id": id, "scid_height": u64_of(c.get("chan_id")) >> 40, "remote_pubkey": str_or_empty(c.get("remote_pubkey")),
                "commitment_type": str_or_empty(c.get("commitment_type")), "unified_sigs": c.get("unified_sigs").cloned().unwrap_or(Value::Bool(false)),
                "active": c.get("active").cloned().unwrap_or(Value::Bool(false)), "capacity_sats": i64_of(c.get("capacity")),
-               "local_sats": i64_of(c.get("local_balance")), "usable": why.is_none(), "refused": why})
+               "local_sats": i64_of(c.get("local_balance")), "remote_sats": i64_of(c.get("remote_balance")), "usable": why.is_none(), "refused": why})
     }).collect();
     (ok, report)
+}
+
+/// What the node can be paid now, about: over its active channels, the other side's balance less the
+/// reserve that side must keep, never below 0. A seller with none cannot be paid at all, whatever it
+/// holds itself, so the seller's pages say so before a buyer's payment fails. The reserve is the
+/// node's word (`remote_constraints.chan_reserve_sat`, or the older `remote_chan_reserve_sat`); a node
+/// that gives neither is taken to hold LND's default, 1% of the channel and at least 354 sat.
+pub fn receivable_sats(chans: &[Value]) -> i64 {
+    chans.iter().filter(|c| c.get("active") == Some(&Value::Bool(true))).map(|c| {
+        let reserve = c.get("remote_constraints").and_then(|r| r.get("chan_reserve_sat")).or(c.get("remote_chan_reserve_sat"))
+            .map(|r| i64_of(Some(r))).unwrap_or_else(|| (i64_of(c.get("capacity")) / 100).max(354));
+        (i64_of(c.get("remote_balance")) - reserve).max(0)
+    }).sum()
 }
 
 /// The node's coins confirmed below `split_height` (they exist on the SHA-256 chain too): they must never
@@ -2038,6 +2051,8 @@ impl Signer {
                 if let (Some(b), None) = (&self.ln, &self.ln_error) {
                     if let Ok(chans) = b.channels() {
                         o["exposure"] = self.ln_exposure(&pol, &chans, None).0;
+                        // a seller who never pays through the wallet still needs to know it can be paid
+                        o["receivable_sats"] = receivable_sats(&chans).into();
                     }
                 }
                 return o;
@@ -2067,7 +2082,10 @@ impl Signer {
             }
             vec![]
         });
-        let chans = read("channels", true, ln.channels());
+        let chans = ln.channels();
+        // what the node can be paid, only from a list it gave: an unread one is not "nothing to receive"
+        let receivable = chans.as_ref().ok().map(|c| receivable_sats(c));
+        let chans = read("channels", true, chans);
         let utxos = read("coins", false, ln.utxos());
         let (ids, report) = self.ln_channels(&chans, split);
         let tip = node::height(&*self.node).map(|h| h as i64).unwrap_or(0);
@@ -2119,6 +2137,9 @@ impl Signer {
         }));
         if let Some(r) = reason {
             out["reason"] = r.into();
+        }
+        if let Some(r) = receivable {
+            out["receivable_sats"] = r.into();
         }
         if !presplit.is_empty() {
             warnings.insert(0, "the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on the SHA-256 chain)".into());
@@ -2330,5 +2351,26 @@ mod tests {
         assert_eq!((body["amt_msat"].as_str(), body["final_cltv_delta"].as_u64(), body["use_mission_control"].as_bool(), body["outgoing_chan_id"].as_str()),
                    (Some("64000"), Some(40), Some(true), Some("123")));
         assert_eq!(body["route_hints"], json!(hints));
+    }
+
+    /// What the node can be paid: the other side's balance less its reserve, over active channels only,
+    /// with LND's numbers as strings. FAILS before: nothing said how much a seller could receive.
+    #[test]
+    fn what_the_node_can_receive_is_the_remote_balance_less_its_reserve() {
+        let chans = vec![
+            // the node's word for the reserve
+            json!({"active": true, "capacity": "100000", "remote_balance": "60000", "remote_constraints": {"chan_reserve_sat": "1000"}}),
+            // no reserve given: 1% of the channel, at least 354
+            json!({"active": true, "capacity": "20000", "remote_balance": "5000"}),
+            // under its reserve: nothing, never below 0
+            json!({"active": true, "capacity": "1000000", "remote_balance": "7085", "remote_chan_reserve_sat": "10000"}),
+            // inactive: cannot carry a payment now
+            json!({"active": false, "capacity": "100000", "remote_balance": "90000"}),
+        ];
+        assert_eq!(receivable_sats(&chans), 59_000 + (5_000 - 354));
+        assert_eq!(receivable_sats(&[]), 0);
+        // the report carries each channel's remote balance beside its local one
+        let (_, report) = usable_channels(&chans[..1], 0);
+        assert_eq!(report[0]["remote_sats"], 60_000);
     }
 }

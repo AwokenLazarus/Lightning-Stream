@@ -856,7 +856,7 @@ impl App {
         })
     }
 
-    fn keys_stored(&self) -> bool {
+    pub(crate) fn keys_stored(&self) -> bool {
         self.cfg.gw.dir.join(GW_INVOICES).is_file() && self.cfg.gw.dir.join(GW_INFO).is_file()
     }
 

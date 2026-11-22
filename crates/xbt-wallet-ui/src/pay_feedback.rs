@@ -210,6 +210,16 @@ pub fn spendable_sats(ln: &Value) -> Option<i64> {
     }).sum())
 }
 
+/// What the Lightning node can be paid now, about, from the signer's `ln_status` (`receivable_sats`:
+/// over its active channels, the other side's balance less its reserve). `None` where that is not
+/// known: no node connected, its channels not read, or a signer from before it said this.
+pub fn receivable_sats(ln: &Value) -> Option<i64> {
+    if ln.get("configured") == Some(&Value::Bool(false)) {
+        return None;
+    }
+    ln.get("receivable_sats")?.as_i64()
+}
+
 /// The warning shown before paying, as a card, where the node can't send `need`; empty where it can
 /// or where that is not known.
 pub fn cant_send_card(spendable: Option<i64>, need: i64, to: &str) -> String {
@@ -416,6 +426,15 @@ mod tests {
                            {"usable": true, "capacity_sats": 20_000, "local_sats": 500}]));
         assert_eq!(spendable_sats(&two), Some(49_000 + 146));
         assert_eq!(spendable_sats(&json!({"ready": false, "reason": "no key"})), None);
+    }
+
+    /// What the node can be paid is the signer's word; not known without a node or from an older signer.
+    #[test]
+    fn what_the_node_can_receive_is_the_signers_word() {
+        assert_eq!(receivable_sats(&json!({"configured": true, "receivable_sats": 59_000})), Some(59_000));
+        assert_eq!(receivable_sats(&json!({"configured": true, "receivable_sats": 0})), Some(0));
+        assert_eq!(receivable_sats(&json!({"configured": true, "channels": []})), None);
+        assert_eq!(receivable_sats(&json!({"configured": false, "receivable_sats": 0})), None);
     }
 
     /// The warning before paying: shown where what the node can send is under the ticket, with the
