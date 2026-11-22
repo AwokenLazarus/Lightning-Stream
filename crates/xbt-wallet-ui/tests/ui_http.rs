@@ -2489,6 +2489,9 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let page = br.get("/sell").body;
     assert!(page.contains(">Lightning Stream<") && page.contains("href=\"./sell\"") && page.contains("href=\"./browse\""), "{page}");
     assert!(page.contains("Not selling yet") && page.contains("Connect your Lightning node"), "{page}");
+    // a box whose hashmaker is off says how to turn it on, step by step, in the installer's own words
+    let off = br.get("/sell-hashrate").body;
+    assert!(off.contains("Renting out miners is off on this box") && off.contains("Turn it on?") && off.contains("answer <strong>1</strong>"), "{off}");
     // plain words on the main screen; the gateway's own terms only inside the collapsed parts
     let main_part = page[page.find("<main").unwrap()..].split("<details").next().unwrap().replace("<em>Macaroons</em>", "");
     // the words a person reads: the text between the tags

@@ -860,7 +860,15 @@ impl App {
     pub(crate) fn sell_hashrate_page(&self, ctx: &Ctx) -> Resp {
         let Some(base) = self.cfg.hash.hasher.clone() else {
             return self.html_page("Sell hashrate", "Sell hashrate", ctx,
-                "<p class=\"empty\">Renting out miners is off in this install. On Umbrel it is part of the app; on Linux, run install.sh again and turn the hashmaker on.</p>", "");
+                // each step by its own words in install.sh: a seller on Linux was left with "run install.sh again"
+                // and no idea which question to answer (the installer keeps every other answer as it is)
+                "<section class=\"card\"><h2>Renting out miners is off on this box</h2>\
+                 <p>Turn it on once. After that, this page shows where to point your miners and what is left to do.</p>\
+                 <ol><li>On Linux, run <code>install.sh</code> again, the way you installed the app. It keeps your answers: press Enter at each question to leave it as it is.</li>\
+                 <li>At <strong>Hashmaker: rent this machine's miners out</strong>, where it asks <em>Turn it on?</em>, answer <strong>1</strong>.</li>\
+                 <li>It then asks for this machine's address on your network. Give the address your miners can reach.</li>\
+                 <li>When it has finished, open this page again.</li></ol>\
+                 <p class=\"hint\">On Umbrel, renting out miners is part of the app, with nothing to turn on.</p></section>", "");
         };
         // a pay address left behind by a change of reach (a shop gone Private under 0.2.2) is put right here,
         // and the hashmaker republishes its offer
