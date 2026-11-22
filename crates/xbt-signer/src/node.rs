@@ -94,6 +94,23 @@ impl KnotsRpc {
 /// failure is `rpc_error`: the call may or may not have run (AGP-080: `pay` keeps its booking then).
 pub const REFUSED: &str = "rpc_refused";
 
+/// The node answered HTTP 401 or 403: it is running and refused the app's user name or password. Told apart from
+/// a node that does not answer, because the owner fixes the two in different places.
+pub const LOGIN_REFUSED: &str = "rpc_login";
+
+/// What is wrong with a node that did not give an answer, in a word the app's pages choose their text by
+/// (`node_status`'s `problem`): `login_refused` (it answered and refused the login), `starting` (it answered
+/// "still loading", JSON-RPC code -28), `no_connection` (nothing answered: stopped, a wrong address or port,
+/// or too slow), `other` (it answered and refused the call for another reason).
+pub fn problem(e: &crate::Error) -> &'static str {
+    match e.code.as_str() {
+        LOGIN_REFUSED => "login_refused",
+        REFUSED if e.msg.contains("\"code\":-28") => "starting",
+        REFUSED => "other",
+        _ => "no_connection",
+    }
+}
+
 impl Node for KnotsRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.call_on(&self.agent, method, params)
@@ -126,6 +143,10 @@ impl KnotsRpc {
         let body = json!({"jsonrpc": "1.0", "id": "b2", "method": method, "params": params});
         let resp = match agent.post(&url).set("Authorization", &auth).set("Content-Type", "application/json").send_string(&body.to_string()) {
             Ok(r) => r,
+            // before the body is looked at: a refused login has no JSON-RPC error in it. The message names no user or password
+            Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+                return Err(err(LOGIN_REFUSED, format!("the node refused the app's login (HTTP {code})")));
+            }
             Err(ureq::Error::Status(code, r)) => {
                 let raw = r.into_string().unwrap_or_default();
                 // a JSON-RPC error comes back with HTTP 500 and a body; report the node's error
@@ -295,4 +316,54 @@ pub fn find_spender(node: &dyn Node, txid: &str, vout: u32, from_height: u64, li
 /// Whether `tx` (verbose) spends `(txid, vout)`.
 pub fn tx_spends(tx: &Value, txid: &str, vout: u32) -> bool {
     spends(tx, txid, vout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A one-answer web server: reads the request, sends `reply`, and gives its port.
+    fn serve_once(reply: &'static str) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut c, _)) = l.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn node_on(port: String) -> KnotsRpc {
+        let d = std::env::temp_dir().join(format!("node-login-{port}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".cookie"), "someone:wrong-secret").unwrap();
+        let mut n = KnotsRpc::new(&d, "w");
+        n.port = port;
+        n.host = "127.0.0.1".into();
+        n.auth_file = None;
+        n
+    }
+
+    #[test]
+    fn a_refused_login_a_closed_port_and_a_loading_node_are_told_apart() {
+        let refused = node_on(serve_once("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+            .call("getblockcount", json!([])).unwrap_err();
+        assert_eq!((problem(&refused), refused.code.as_str()), ("login_refused", LOGIN_REFUSED));
+        assert!(!refused.msg.contains("someone") && !refused.msg.contains("wrong-secret"), "{}", refused.msg);
+        let forbidden = node_on(serve_once("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+            .call("getblockcount", json!([])).unwrap_err();
+        assert_eq!(problem(&forbidden), "login_refused");
+        // a port nothing listens on: bound, then let go
+        let closed = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port().to_string() };
+        assert_eq!(problem(&node_on(closed).call("getblockcount", json!([])).unwrap_err()), "no_connection");
+        let body = r#"{"result":null,"error":{"code":-28,"message":"Loading block index..."},"id":"b2"}"#;
+        let loading: &'static str = Box::leak(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_boxed_str());
+        assert_eq!(problem(&node_on(serve_once(loading)).call("getblockcount", json!([])).unwrap_err()), "starting");
+        assert_eq!(problem(&err(REFUSED, r#"{"code":-1,"message":"x"}"#)), "other");
+        assert_eq!(problem(&err("rpc_error", "timed out")), "no_connection");
+    }
 }

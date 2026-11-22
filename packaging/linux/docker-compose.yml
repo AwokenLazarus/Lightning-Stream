@@ -164,6 +164,9 @@ services:
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
       XBT_SHOPS_FILE: /data/run/shops/shops.json
+      # said when the node refuses the app's login: init writes the node login from these two .env lines, and a compose
+      # restart keeps the old environment, so the change needs the containers made again (docs/LINUX.md: `docker compose up -d`)
+      XBT_UI_NODE_LOGIN_HINT: "Open the .env file in the folder you installed it to (~/lightning-stream unless you chose another), set the LS_NODE_RPC_USER and LS_NODE_RPC_PASS lines to the user name and password your node uses, save it, then run in that folder: docker compose up -d"
       XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
       # the built-in Stream relay's settings and status (Settings → Stream relays)
       XBT_UI_RELAY_DIR: /data/run/relay

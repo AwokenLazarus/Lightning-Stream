@@ -39,7 +39,7 @@ use crate::http;
 use secp256k1::SecretKey;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use xbt_hashlink::hashmaker::{self, Hashmaker};
@@ -416,7 +416,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     let mut rentable = rentable_now(&settings, xbt_hashlink::now_ms(), shop);
     let mut last: Option<(Said, bool)> = None;
     let mut last_pub = Instant::now();
-    let mut served = Served::load(path.as_ref().map(|p| p.with_file_name("hash-summary.json")));
+    let mut served = Served::load(summary_file(f.get("key").map(Path::new), path.as_deref()));
     loop {
         std::thread::sleep(Duration::from_secs(2));
         if let (Some(r), Some(n)) = (f.get("relays"), f.get("nostr-key")) {
@@ -547,6 +547,19 @@ struct Served {
     last: Option<Instant>,
 }
 
+/// Where the rentals summary is kept: beside the hashmaker's key, in its own folder. It used to be beside
+/// the settings file, which is the UI's folder and which the packages give the hashmaker read-only, so it
+/// was never written there and a restart lost what had been served. A summary an older install did write
+/// beside the settings is carried over once. With no key file given, beside the settings as before.
+fn summary_file(key: Option<&Path>, settings: Option<&Path>) -> Option<PathBuf> {
+    let old = settings.map(|p| p.with_file_name("hash-summary.json"));
+    let Some(new) = key.map(|k| k.with_file_name("hash-summary.json")) else { return old };
+    if let Some(old) = old.filter(|o| *o != new && o.exists() && !new.exists()) {
+        let _ = std::fs::copy(old, &new);
+    }
+    Some(new)
+}
+
 impl Served {
     const EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -582,7 +595,10 @@ impl Served {
         }
         let summary = trust::Summary { hashmaker: me, rentals: self.rentals.values().cloned().collect() };
         if let Some(p) = &self.file {
-            let _ = std::fs::write(p, summary.to_json().to_string());
+            // said once it fails: kept quiet, a folder the hashmaker could not write lost the record at every restart
+            if let Err(e) = std::fs::write(p, summary.to_json().to_string()) {
+                eprintln!("hashmaker: the rentals summary was not saved to {}: {e}", p.display());
+            }
         }
         let Ok(nostr) = super::read_key(nostr_file).map(xbt_nostr::event::Keys::new) else { return };
         self.last = Some(Instant::now());
@@ -943,6 +959,30 @@ mod tests {
     }
 
     /// What goes to the relays of the rentals served: counts and totals, with no renter's key, rental or time.
+    /// The summary is kept beside the key, in the hashmaker's own folder: the settings' folder is the UI's and
+    /// read-only to the hashmaker in the packages. FAILS before: it was kept beside the settings, never written.
+    #[test]
+    fn the_summary_is_kept_beside_the_key_and_an_old_one_is_carried_over() {
+        let dir = std::env::temp_dir().join(format!("hashmaker-summary-file-{}", hex::encode(xbt_hashlink::noise::fresh_key().secret_bytes())));
+        let (own, ui) = (dir.join("hashrate"), dir.join("run"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&ui).unwrap();
+        let (key, settings) = (own.join("link.key"), ui.join("settings.json"));
+        assert_eq!(summary_file(Some(&key), Some(&settings)), Some(own.join("hash-summary.json")));
+        assert!(!own.join("hash-summary.json").exists(), "nothing to carry over yet");
+        // what an older install did write beside the settings comes along, once
+        std::fs::write(ui.join("hash-summary.json"), "{\"old\":true}").unwrap();
+        assert_eq!(summary_file(Some(&key), Some(&settings)), Some(own.join("hash-summary.json")));
+        assert_eq!(std::fs::read_to_string(own.join("hash-summary.json")).unwrap(), "{\"old\":true}");
+        std::fs::write(own.join("hash-summary.json"), "{\"new\":true}").unwrap();
+        summary_file(Some(&key), Some(&settings));
+        assert_eq!(std::fs::read_to_string(own.join("hash-summary.json")).unwrap(), "{\"new\":true}", "the newer one is not overwritten");
+        // no key file given: beside the settings, as before
+        assert_eq!(summary_file(None, Some(&settings)), Some(ui.join("hash-summary.json")));
+        assert_eq!(summary_file(None, None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_published_summary_names_no_renter() {
         let relay = xbt_nostr::standin::StandinRelay::start().unwrap();

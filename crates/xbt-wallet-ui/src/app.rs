@@ -35,6 +35,8 @@ pub mod hashrate;
 pub(crate) mod inference_page;
 #[path = "vpn_page.rs"]
 pub(crate) mod vpn_page;
+#[path = "backups_page.rs"]
+mod backups_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -423,6 +425,12 @@ impl App {
         self.signer.call(method, params)
     }
 
+    /// Why the XBT node is not giving the app what it needs, in the one set of words every page uses
+    /// ([`crate::node_words`]); `None` when it is fine or the signer did not say.
+    pub(crate) fn node_trouble_words(&self) -> Option<String> {
+        crate::node_words::trouble(&self.call("node_status", json!({}))).map(|t| crate::node_words::words(t, &self.cfg.node_login_hint))
+    }
+
     pub(crate) fn cookie(&self, req: &Req, sid: &str, max_age: i64) -> String {
         let secure = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         format!("{COOKIE}={sid}; Path={}; HttpOnly; SameSite=Strict; Max-Age={max_age}{}", self.cfg.base_path, if secure { "; Secure" } else { "" })
@@ -647,6 +655,7 @@ impl App {
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
+            "/backups" => self.backups_page(&ctx),
             "/agents" => self.agents(&ctx, false),
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
@@ -1140,7 +1149,10 @@ impl App {
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let (ready, connected, _) = self.node_state();
         let ack = connected && self.ack_needed();
-        b.push_str(&self.get_started(ctx, human, connected, ack));
+        // the hashmaker is asked once: what it says is both the Sell card's words and whether this box sells
+        let (renting_on, renting) = self.hashrate_summary_on().map_or((false, None), |(on, s)| (on, Some(s)));
+        let sells = self.sells(renting_on);
+        b.push_str(&self.get_started(ctx, human, connected, ack, sells));
         let services = self.file_services().unwrap_or_default();
         let sellers = {
             let mut o: Vec<String> = services.iter().filter_map(|s| crate::services::http_origin(&s.seller)).collect();
@@ -1157,10 +1169,26 @@ impl App {
             else { format!("{} service{} from {} seller{}: {}.", services.len(), if services.len() == 1 { "" } else { "s" }, sellers,
                            if sellers == 1 { "" } else { "s" }, cats.join(", ")) },
             if human && ready { " primary" } else { "" }));
-        if self.cfg.sell {
-            let (class, headline, next) = self.sell_summary();
-            b.push_str(&format!("<div class=\"card choice-card\"><h2>Sell a service</h2><p><span class=\"pill {class}\">{}</span></p><p>{}</p>\
-                <p><a class=\"button-link\" href=\"./sell\">Open Sell</a></p></div>", esc(&headline), esc(&next)));
+        // what this box sells: its shop's services, and its miners when it rents them out. A box that only rents
+        // out miners said "Not selling yet" here while its offer was listed (issue #75), so each is said by itself
+        if self.cfg.sell || renting.is_some() {
+            let mut rows = String::new();
+            // a shop with nothing in it is not news beside miners that are rented out
+            if self.cfg.sell && !(renting.is_some() && self.shop().offers.is_empty()) {
+                let (class, headline, next) = self.sell_summary();
+                rows.push_str(&format!("<p><span class=\"pill {class}\">{}</span></p><p>{}</p>", esc(&headline), esc(&next)));
+            }
+            if let Some((class, headline, next)) = &renting {
+                // "below" is Sell → Hashrate's own page
+                let next = next.replace(" below.", " on the Hashrate page.");
+                rows.push_str(&format!("<p><span class=\"pill {class}\">{}</span></p><p>{}</p>", esc(headline), esc(&next)));
+            }
+            let links = match (self.cfg.sell, renting.is_some()) {
+                (true, true) => "<a class=\"button-link\" href=\"./sell\">Open Sell</a> <a class=\"button-link\" href=\"./sell-hashrate\">Hashrate</a>",
+                (false, true) => "<a class=\"button-link\" href=\"./sell-hashrate\">Open Hashrate</a>",
+                _ => "<a class=\"button-link\" href=\"./sell\">Open Sell</a>",
+            };
+            b.push_str(&format!("<div class=\"card choice-card\"><h2>Sell a service</h2>{rows}<p>{links}</p></div>"));
         }
         b.push_str("</section>");
         let line = if ready {
@@ -1170,7 +1198,8 @@ impl App {
         } else if ack {
             "<span class=\"pill warn\">One last step</span> Confirm that the app may pay with real money. <a href=\"./lightning#ack\">Start paying</a>".into()
         } else if connected {
-            "<span class=\"pill warn\">Not ready</span> Your Lightning node is connected but cannot pay yet. <a href=\"./lightning\">See why</a>".into()
+            format!("<span class=\"pill warn\">Can't pay yet</span> Your Lightning node is connected but cannot pay yet.{} <a href=\"./lightning\">See why</a>",
+                    if self.cfg.sell || renting.is_some() { " Selling does not need this." } else { "" })
         } else {
             "<span class=\"pill warn\">Not connected</span> Connect your Lightning node to pay for services. <a href=\"./lightning\">Connect it</a>".into()
         };
@@ -1178,10 +1207,15 @@ impl App {
         self.page("Home", ctx, b)
     }
 
+    /// Whether this box is set up to sell something: its miners are for rent, or its shop has a service.
+    fn sells(&self, renting_on: bool) -> bool {
+        renting_on || (self.cfg.sell && !self.shop().offers.is_empty())
+    }
+
     /// Home's "First steps" list, until every step is done: the approval key, the node, the starter
     /// rules (with, on mainnet, the yes to paying with real money ticked as they are signed), a shop allowed (the demo shop in one press where the box
     /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
-    fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
+    fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool, sells: bool) -> String {
         let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
         let paying = paying_on(&pol);
         // allowed as the signer decides: also a shop allowed only through its node's `ln:` line
@@ -1225,8 +1259,15 @@ impl App {
             return String::new();
         }
         let next = steps.iter().position(|s| !s.0).unwrap_or(0);
-        let mut b = format!("<section class=\"card primary\" id=\"get-started\"><h2>First steps</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
-                            steps.len());
+        // these steps are all for buying. On a box that sells, they are said to be so and are not the page's main
+        // thing: a seller who never buys read "1 of 4 done" as the box not being ready to sell (issue #75)
+        let mut b = if sells {
+            format!("<section class=\"card\" id=\"get-started\"><h2>First steps to buy</h2><p class=\"small\">{done} of {} done. \
+                     These are for buying from others. Selling does not need them.</p><ol class=\"checklist\">", steps.len())
+        } else {
+            format!("<section class=\"card primary\" id=\"get-started\"><h2>First steps</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+                    steps.len())
+        };
         for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
             let action = if i != next {
                 String::new()
@@ -1261,10 +1302,8 @@ impl App {
             b.push_str("<div class=\"flash warn\">This box holds more than you allowed: <a href=\"./keys\">move the extra to your own wallet</a>.</div>");
         }
         // the signer runs without the XBT node, and the amounts on it wait for it
-        if self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == false) {
-            b.push_str("<div class=\"flash warn\">The app cannot reach your XBT node yet, so the amounts on it below may be out of date. \
-                        Paying over Lightning does not need it. Check that the node is running and that the app has its address and \
-                        password (on Linux: LS_NODE_RPC_* in .env).</div>");
+        if let Some(why) = self.node_trouble_words() {
+            b.push_str(&format!("<div class=\"flash warn\">{} The amounts on it below may be out of date. Paying over Lightning does not need it.</div>", esc(&why)));
         }
         // Lightning first: what pays for services. The XBT node's on-chain coins are another wallet, said apart
         // (0.2.1 showed "On your node 0 sats" while the channels held 286,000)
@@ -1272,7 +1311,7 @@ impl App {
         let ready = ln["ready"] == true && ln["real_money_ack_needed"] != true;
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
         b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
-                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() })]));
+                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Can't pay yet</span> <a href=\"./lightning\">See why</a>".into() })]));
         // the simple view: what can be spent, favorite shops, and where to go; the coins on chain and the rest are behind Advanced
         if self.simple() {
             b.push_str("<p class=\"small\">This is what you can spend in shops right now, within your <a href=\"./limits\">limits</a>.</p></div></section>");

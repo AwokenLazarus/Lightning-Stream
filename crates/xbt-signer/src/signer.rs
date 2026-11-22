@@ -612,8 +612,14 @@ impl Signer {
             "chain_backend" => json!({"backend": "rpc"}),
             // whether the XBT node answers now: a signer whose chain is set (B2_CHAIN) starts without it, and says so here
             "node_status" => match node::height(&*self.node) {
-                Ok(h) => json!({"reachable": true, "chain": self.chain, "height": h}),
-                Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
+                // `syncing`: it answers but is still catching up (its own `initialblockdownload`); a node that will not say is not called so
+                Ok(h) => {
+                    let syncing = self.node.call("getblockchaininfo", json!([])).ok().and_then(|i| i["initialblockdownload"].as_bool()).unwrap_or(false);
+                    json!({"reachable": true, "chain": self.chain, "height": h, "syncing": syncing})
+                }
+                // `problem` says why in a word ([`node::problem`]), for the pages: a refused login is not a node that is away
+                Err(e) => json!({"reachable": false, "chain": self.chain, "problem": node::problem(&e),
+                                 "reason": e.msg.chars().take(200).collect::<String>()}),
             },
             // what a hashmaker's price follows (Sell → Hashrate): the tip's difficulty and subsidy as the node says them.
             // What it does not say is left out, for the caller to refuse: nothing here is made up. A node that won't

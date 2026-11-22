@@ -307,6 +307,25 @@ fn sessions_expire_when_idle() {
 }
 
 #[test]
+fn the_backups_page_lists_what_to_save_and_is_linked_from_settings() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/backups");
+    assert_eq!(page.status, 200);
+    for want in ["Backups and recovery", "Lightning Fork", "Your approval key", "The app password", "Your shop and listing keys", "The data folder",
+                 "saved on this box", "href=\"./keys\""] {
+        assert!(page.body.contains(want), "/backups lacks {want}");
+    }
+    assert!(!page.body.contains("href=\"/") && !page.body.contains(PW));
+    // linked from the settings tabs, and the page belongs to that section
+    for from in ["/keys", "/setup"] {
+        assert!(br.get(from).body.contains("href=\"./backups\""), "{from} does not link to /backups");
+    }
+    assert_eq!(B::new(&bx.base).get("/backups").location(), "./login");
+}
+
+#[test]
 fn behind_a_proxy_prefix_and_the_peer_allowlist() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let bx = start(json!({}), false, |c| {
@@ -890,7 +909,7 @@ fn no_secret_is_in_any_page_as_it_opens() {
     leaks("/login", &B::new(&bx.base).get("/login").body);
     let mut br = logged_in(&bx);
     for p in ["/", "/wallet", "/browse", "/services", "/sell", "/sell-hashrate", "/sell-vpn", "/hashrate", "/ai", "/vpn", "/nostr", "/relays",
-              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/agents", "/setup", "/lightning",
+              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/backups", "/agents", "/setup", "/lightning",
               "/your-gateway", "/api/pending", "/api/hashrate-rentals", "/sell?edit=app"] {
         let r = br.get(p);
         leaks(p, &format!("{} {:?}", r.body, r.headers));
@@ -2470,6 +2489,9 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let page = br.get("/sell").body;
     assert!(page.contains(">Lightning Stream<") && page.contains("href=\"./sell\"") && page.contains("href=\"./browse\""), "{page}");
     assert!(page.contains("Not selling yet") && page.contains("Connect your Lightning node"), "{page}");
+    // a box whose hashmaker is off says how to turn it on, step by step, in the installer's own words
+    let off = br.get("/sell-hashrate").body;
+    assert!(off.contains("Renting out miners is off on this box") && off.contains("Turn it on?") && off.contains("answer <strong>1</strong>"), "{off}");
     // plain words on the main screen; the gateway's own terms only inside the collapsed parts
     let main_part = page[page.find("<main").unwrap()..].split("<details").next().unwrap().replace("<em>Macaroons</em>", "");
     // the words a person reads: the text between the tags
@@ -3091,6 +3113,14 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Sell hashrate");
     }
     assert!(p.body.contains("href=\"./sell-hashrate\" aria-current"), "Hashrate is a tab of Sell");
+    // Home says the same of the miners as this page: a box that only rents them out is selling (issue #75)
+    let home = br.get("/").body;
+    assert!(home.contains("Renting out: 1 of 2 miners rented") && home.contains("href=\"./sell-hashrate\""), "Home leaves the rented miners out: {home}");
+    // and the steps for buying are not the seller's to do: where Home lists them, it says they are for buying
+    assert!(!home.contains("<h2>First steps</h2>"), "a box that sells is told its buying steps are first steps: {home}");
+    if home.contains("id=\"get-started\"") {
+        assert!(home.contains("<h2>First steps to buy</h2>") && home.contains("Selling does not need them."), "{home}");
+    }
     assert!(br.get("/browse").body.contains("href=\"./hashrate\""), "and of Services");
     plain("/sell-hashrate", &p.body);
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "stop"), ("rental", "r1")]);
@@ -3344,6 +3374,236 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
     assert!(br.flash_after(&r).contains("Renting is off"));
     let p = br.get("/sell-hashrate");
     assert!(p.body.contains(OFF) && !p.body.contains(ON), "saved off: {}", p.body);
+}
+
+/// The Lightning node a seller is paid through, in memory: its channels, as LND lists them, and nothing else.
+struct ChannelsLn(std::sync::Mutex<Vec<Value>>);
+impl xbt_signer::ln::LnBackend for ChannelsLn {
+    fn get_info(&self) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn block_hash(&self, _: i64) -> xbt402::Result<String> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn decode(&self, _: &str) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn channels(&self) -> xbt402::Result<Vec<Value>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn send(&self, _: &xbt_signer::ln::SendRequest) -> xbt402::Result<Value> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn lookup(&self, _: &str) -> xbt402::Result<Option<Value>> {
+        Err(xbt402::ChannelError::new("ln_backend", "not in this test"))
+    }
+    fn utxos(&self) -> xbt402::Result<Vec<Value>> {
+        Ok(vec![])
+    }
+    fn describe(&self) -> String {
+        "in-memory node".into()
+    }
+}
+
+/// What the hashmaker's /status says in the checklist test: 0 before anything is set up, 1 once it all is.
+static RENT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The rentals the hashmaker's /status lists in the checklist test, once it is all set up: 0 none, 1 one going on and
+/// paid, 2 the same one ended with its miner home, 3 none again (the hashmaker restarted and forgot it).
+static RENT_PAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sell → Hashrate's checklist: each thing renting out needs, in order, done or with its one next step; how much
+/// the node can be paid, and when nothing, why and what to do in plain words; one line once all is done.
+///
+/// FAILS before: no checklist, and nothing said the box could not be paid until a rental failed.
+#[test]
+fn sell_hashrate_lists_what_renting_out_needs_and_how_much_the_node_can_receive() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    RENT_PAID.store(0, std::sync::atomic::Ordering::SeqCst);
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") if RENT_READY.load(std::sync::atomic::Ordering::SeqCst) => {
+            let paid = RENT_PAID.load(std::sync::atomic::Ordering::SeqCst);
+            // a rental from someone else's box: 3 pieces paid at 40 sats, 25 shares proven by the hashmaker's own check
+            let rental = json!({"rental": "ab12", "startedMs": 1_000, "paid": 3, "earnedMsat": 120_000, "miners": ["S19"],
+                                "meter": {"work": "422212465065984", "proven": 25, "accepted": 0},
+                                "stopped": if paid == 2 { json!({"reason": "the hashtaker ended it", "atMs": 90_000}) } else { Value::Null }});
+            // an earlier one that paid nothing: no evidence of anything
+            let unpaid = json!({"rental": "cd34", "startedMs": 500, "paid": 0, "earnedMsat": 0, "meter": {"work": "0", "proven": 0}, "stopped": {"reason": "no payment"}});
+            json!({"open": true,
+            "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
+            "minersAddress": "umbrel.local:23340",
+            "rentals": if paid == 1 { json!([rental]) } else { json!([]) },
+            "finished": match paid { 0 | 1 => json!([unpaid]), 2 => json!([unpaid, rental]), _ => json!([]) },
+            "miners": [{"name": "S19", "connected": true, "hashrateHs": 1.0e14, "earnedMsat": 0, "rentedTo": if paid == 1 { json!("ab12") } else { Value::Null }}],
+            "listing": {"ok": true, "miners": 1, "freeMiners": 1}})
+        }
+        ("GET", "/status") => json!({"open": false, "settings": {"enabled": false, "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
+                                      "minersAddress": "umbrel.local:23340", "miners": [], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    // one channel, all of it on this side: nothing can come in
+    let ln = Arc::new(ChannelsLn(std::sync::Mutex::new(vec![
+        json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "99000", "remote_balance": "0"})])));
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln: Some(ln.clone()), ..Default::default() }).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let htok = side.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let gw = side.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let (gw2, settings) = (gw.clone(), side.path().join("hashrate/settings.json"));
+    // where the box keeps its first rental, beside the renting settings
+    let kept = settings.with_file_name("first-rental.json");
+    let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| {
+        c.sell = true;
+        c.gw.dir = gw2;
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher);
+        c.hash.hasher_token = Some(htok);
+        c.hash.settings = settings;
+    });
+    let mut br = logged_in(&bx);
+
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(p.find("id=\"rent-checklist\"").unwrap() < p.find("id=\"rent-form\"").unwrap(), "near the top, before the form");
+    assert!(list.contains("Before you rent out") && list.contains("1 of 6 done"), "{list}");
+    // in order, the XBT node done, the Lightning node the step to do now, with its one button
+    let at = |s: &str| list.find(s).unwrap_or_else(|| panic!("{s} missing: {list}"));
+    assert!(at("Your XBT node answers") < at("Your Lightning node is connected") && at("Your Lightning node is connected") < at("You can receive payments")
+            && at("You can receive payments") < at("Your miners are connected") && at("Your miners are connected") < at("Your offer is listed")
+            && at("Your offer is listed") < at("A first rental has been paid"), "{list}");
+    assert!(list.contains("<li class=\"done\"><strong>Your XBT node answers</strong>"), "{list}");
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your Lightning node is connected</strong>") && list.contains("href=\"./sell\">Connect it</a>"), "{list}");
+    assert_eq!(list.matches("button-link").count(), 1, "one button, on the step to do now: {list}");
+    // nothing can come in: said, with why and the ways to fix it, without jargon
+    assert!(list.contains("Can receive about 0 sats.") && list.contains("ask another node to open a channel to you")
+            && list.contains("open a channel yourself and spend some of it"), "{list}");
+    for j in ["inbound", "liquidity", "remote balance", "reserve", "msat", "htlc"] {
+        assert!(!list.to_lowercase().contains(j), "\"{j}\" in the checklist: {list}");
+    }
+    assert!(list.contains("Say where your miners hash when nobody rents them") && list.contains("Turn renting on in the form below"), "{list}");
+    assert!(!p.contains("Ready to be rented"));
+
+    // all done: the shop's keys to the node, room to be paid, a pool and a miner, the offer listed
+    std::fs::write(gw.join("invoices.macaroon"), "00").unwrap();
+    std::fs::write(gw.join("info.macaroon"), "00").unwrap();
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "39000", "remote_balance": "60000",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    RENT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+    // ready to be rented, but nobody has yet: the last line says why this box can't test itself and how to get a first
+    // rental, with no button (it comes from another box), and a rental that paid nothing does not tick it
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(list.contains("<span class=\"pill good\">Ready to be rented</span>") && list.contains("5 of 6 done"), "{list}");
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>A first rental has been paid</strong>"), "{list}");
+    assert!(list.contains("Nobody has rented your miners yet.") && list.contains("a Lightning node can't pay itself")
+            && list.contains("ask another Lightning Stream user to try one piece of yours") && list.contains("rent from a second box")
+            && list.contains("shows the work your miners delivered and the sats you were paid"), "{list}");
+    assert!(!list.contains("button-link"), "nothing on this box to press for it: {list}");
+    assert!(!kept.exists(), "nothing kept before a rental paid");
+    // a rental going on that has paid: done, with what it delivered and earned, as the hashmaker counted it
+    RENT_PAID.store(1, std::sync::atomic::Ordering::SeqCst);
+    let first = "Your first rental: 3 pieces of work paid, 120 sats earned, 25 shares checked by your node.";
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&format!("<p class=\"status-line\" id=\"rent-checklist\"><span class=\"pill good\">Ready to be rented</span> <span class=\"small\">{first} It is going on now.</span></p>")), "{p}");
+    assert!(!p.contains("Before you rent out") && !p.contains("back on your own pool"), "{p}");
+    // ended, its miner home: said so
+    RENT_PAID.store(2, std::sync::atomic::Ordering::SeqCst);
+    let home = format!("{first} It has ended, and your miners are back on your own pool.");
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&home), "{p}");
+    // the hashmaker restarted and forgot its ended rentals: the box keeps its first rental, and claims nothing it can't see
+    RENT_PAID.store(3, std::sync::atomic::Ordering::SeqCst);
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains(&format!("Ready to be rented</span> <span class=\"small\">{first} It has ended")), "kept: {p}");
+    assert!(kept.exists());
+    // with some room, the line says how much (the box not yet otherwise ready, so the list is shown)
+    RENT_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains("<li class=\"done\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 59,000 sats.</span>"), "{p}");
+    assert!(p.contains("4 of 6 done"), "the first rental kept: {p}");
+    // room for less than a hashtaker's smallest payment (a ticket: 546 sats, above this offer's 40 sats a piece): not done, said with the fix
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "98970", "remote_balance": "1030",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell-hashrate").body);
+    assert!(p.contains("<li class=\"now\" aria-current=\"step\"><strong>You can receive payments</strong> <span class=\"small\">Can receive about 30 sats, less than a hashtaker's smallest payment (546 sats). \
+                        To make room, ask another node to open a channel to you"), "{p}");
+    assert!(p.contains("3 of 6 done"), "{p}");
+    // the node stops answering the app's login: the first line says the node runs and refused it, and where to fix it
+    // (the default words here: no platform said otherwise), never a user name or password
+    bx.rig.chain.st.lock().unwrap().login_refused = true;
+    let p = unescape(&br.get("/sell-hashrate").body);
+    let list = &p[p.find("id=\"rent-checklist\"").expect("the checklist")..];
+    let list = &list[..list.find("</section>").unwrap()];
+    assert!(list.contains("<li class=\"now\" aria-current=\"step\"><strong>Your XBT node answers</strong>")
+            && list.contains("Your XBT node is running, but it refused the app's user name or password"), "{list}");
+    assert!(!list.contains("cannot connect") && !list.contains("401"), "{list}");
+}
+
+/// A shop with something to sell and no room to be paid says so on the Sell page, in the Hashrate page's words;
+/// room for a buyer's smallest payment, no offer, or a node whose channels are not known, says nothing.
+#[test]
+fn the_sell_page_warns_when_buyers_cannot_pay_yet() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let media = mock_http(|_| (200, "ok"));
+    // one channel, all of it on this side: nothing can come in
+    let ln = Arc::new(ChannelsLn(std::sync::Mutex::new(vec![
+        json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "99000", "remote_balance": "0"})])));
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln: Some(ln.clone()), ..Default::default() }).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let gw = side.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    // the shop's keys to the node, so the app counts the node as connected
+    std::fs::write(gw.join("invoices.macaroon"), "00").unwrap();
+    std::fs::write(gw.join("info.macaroon"), "00").unwrap();
+    let gw2 = gw.clone();
+    let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| {
+        c.sell = true;
+        c.gw.dir = gw2;
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    });
+    let mut br = logged_in(&bx);
+    let warn = "Buyers can't pay you yet.";
+
+    // (4) nothing to sell yet: no warning, even with no room
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains("Not selling yet") && !p.contains(warn), "{p}");
+
+    // a shop gets an offer
+    let addr = format!("http://{media}");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Test box"), ("public_url", "https://seller.example/")]);
+    assert!(br.flash_after(&r).contains("network id"), "a test chain asks for its network under Advanced");
+    let r = br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                                       ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    assert!(br.flash_after(&r).contains("Advanced settings saved"));
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib")]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("restarts"), "the offer was added: {f} {}", unescape(&r.body));
+
+    // (1) an offer and no room at all
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains("<div class=\"flash warn\"><strong>Buyers can't pay you yet.</strong>"), "{p}");
+    assert!(p.contains("Buyers pay you through your channels") && p.contains("href=\"./lightning\">Your node and channels</a>"), "{p}");
+    // (2) some room, less than a buyer's smallest payment (a ticket: 546 sats)
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "98970", "remote_balance": "1030",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell").body);
+    assert!(p.contains(warn) && p.contains("less than a buyer's smallest payment (546 sats)"), "{p}");
+    // (3) plenty of room: nothing said
+    *ln.0.lock().unwrap() = vec![json!({"active": true, "chan_id": "1", "capacity": "100000", "local_balance": "39000", "remote_balance": "60000",
+                                        "remote_constraints": {"chan_reserve_sat": "1000"}})];
+    let p = unescape(&br.get("/sell").body);
+    assert!(!p.contains(warn) && !p.contains("flash warn"), "{p}");
 }
 
 /// says why in plain words; the address is set, and cleared, on the page.
@@ -6561,4 +6821,75 @@ fn the_suggested_node_on_mainnet_is_one_the_signer_takes() {
     // both, as the page fills them in: tried in order on one approval
     assert_eq!(xbt_signer::ln_open::hosts(&format!("{GENESIS_HOST},{GENESIS_ONION}")).map(|h| h.len()), Some(2));
     assert!(xbt_wallet_ui::config::funding_peer(&format!("{GENESIS_NODE}@{GENESIS_HOST},{GENESIS_ONION}")).is_some());
+}
+
+/// An XBT node that is running and refuses the app's login is said so on every page that waits for the node: the
+/// gateway card and the wallet's flash, and not as a node that is away or still catching up. The platform's own words
+/// say where to fix it, and no user name, password or cookie is ever on a page.
+#[test]
+fn a_node_that_refuses_the_apps_login_is_said_so_apart_from_one_that_is_away() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "127.0.0.1:23339", "reachable": false, "found": []},
+            "bundled": {"addr": "127.0.0.1:23339", "inUse": true, "running": true, "node": false, "masking": false, "state": "waiting for the node"},
+            "blinding": {"state": "can't be checked", "why": "127.0.0.1:23339 doesn't answer"}, "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    // a cookie in the run folder with a user and password that must never come out on a page
+    std::fs::write(gwdir.join("rpc.cookie"), "owner-user:owner-secret-pass").unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+        c.node_login_hint = "Open the .env file, set the LS_NODE_RPC_USER and LS_NODE_RPC_PASS lines, then run docker compose up -d.".into();
+    });
+    let st = xbt_wallet_ui::config::StreamGwSetup { rpcurl: Some("http://node:18443".into()), dir: gwdir.clone(), ..Default::default() };
+    xbt_wallet_ui::stream_gateway::write(&st, &xbt_wallet_ui::stream_gateway::Settings::new(xbt_wallet_ui::stream_gateway::Mode::Solo,
+                                         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"), "regtest").unwrap();
+    let mut br = logged_in(&bx);
+    let pages = |br: &mut B| (unescape(&br.get("/hashrate").body), unescape(&br.get("/wallet").body));
+
+    // the node answers 401: running, login refused
+    bx.rig.chain.st.lock().unwrap().login_refused = true;
+    let (hash, wallet) = pages(&mut br);
+    for (what, page) in [("the gateway card", &hash), ("the wallet page", &wallet)] {
+        assert!(page.contains("Your XBT node is running, but it refused the app's user name or password"), "{what}: {page}");
+        assert!(page.contains("LS_NODE_RPC_USER and LS_NODE_RPC_PASS lines, then run docker compose up -d"), "{what}: {page}");
+        assert!(!page.contains("cannot connect") && !page.contains("401") && !page.contains("owner-secret-pass") && !page.contains("owner-user"), "{what}: {page}");
+    }
+    assert!(hash.contains("Your gateway is waiting for your node") && !hash.contains("Check that the node is running and synced"), "{hash}");
+
+    // the node is not there: other words
+    {
+        let mut c = bx.rig.chain.st.lock().unwrap();
+        c.login_refused = false;
+        c.down = true;
+    }
+    let (hash, wallet) = pages(&mut br);
+    for (what, page) in [("the gateway card", &hash), ("the wallet page", &wallet)] {
+        assert!(page.contains("The app cannot connect to your XBT node. Either the node is not running"), "{what}: {page}");
+        assert!(!page.contains("refused the app"), "{what}: {page}");
+    }
+
+    // answering, and still catching up
+    {
+        let mut c = bx.rig.chain.st.lock().unwrap();
+        c.down = false;
+        c.syncing = true;
+    }
+    let (hash, _) = pages(&mut br);
+    assert!(hash.contains("still catching up with the network") && !hash.contains("refused the app") && !hash.contains("cannot connect"), "{hash}");
+
+    // a healthy node: the card's older words, and no flash on the wallet page
+    bx.rig.chain.st.lock().unwrap().syncing = false;
+    let (hash, wallet) = pages(&mut br);
+    assert!(hash.contains("has no work from your XBT node yet. Check that the node is running and synced."), "{hash}");
+    assert!(!wallet.contains("The amounts on it below may be out of date"), "{wallet}");
 }

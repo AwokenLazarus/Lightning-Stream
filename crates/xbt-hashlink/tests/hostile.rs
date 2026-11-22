@@ -1473,7 +1473,7 @@ fn scripted_maker(proof: Option<&str>) -> (String, PublicKey, mpsc::Receiver<Mak
     let proof = proof.map(str::to_string);
     let (s, r) = mpsc::channel();
     thread::spawn(move || {
-        let lk = link::answer(l.accept().unwrap().0, hk).unwrap();
+        let lk = accept_link(&l, hk);
         let (tx, mut rx) = (lk.tx, lk.rx);
         let Ok(Some(Msg::Hello { rental, terms, .. })) = rx.recv() else { panic!("no hello") };
         tx.send(&Msg::Welcome { rental, terms_hash: hex::encode(terms.hash()), proof }).unwrap();
@@ -1811,7 +1811,7 @@ fn a_hashtaker_tells_an_older_hashmaker_needs_updating() {
     let addr = l.local_addr().unwrap().to_string();
     let hk = noise::fresh_key();
     thread::spawn(move || {
-        let mut lk = link::answer(l.accept().unwrap().0, hk).unwrap();
+        let mut lk = accept_link(&l, hk);
         let Ok(Some(Msg::Hello { rental, .. })) = lk.rx.recv() else { return };
         // the hash of the terms without the start fee, as an older version computes it
         let _ = lk.tx.send(&Msg::Welcome { rental, terms_hash: "00".repeat(32), proof: None });
@@ -2060,6 +2060,18 @@ fn a_link_that_keeps_dropping_ends_the_rental() {
     assert_eq!(resumes.load(Ordering::SeqCst), 1 + hashtaker::COMEBACKS_AN_HOUR as u64);
 }
 
+/// The next hashtaker to connect to a stand-in hashmaker: a connection that is not a link handshake is let go.
+/// Where something watches for new listeners (an editor's port forwarding asks each one "GET /"), that stranger
+/// sat in the queue, the test took it for the hashtaker coming back, and one run in three failed with
+/// "unknown handshake version".
+fn accept_link(l: &TcpListener, hk: SecretKey) -> link::Link {
+    loop {
+        if let Ok(lk) = link::answer(l.accept().unwrap().0, hk) {
+            return lk;
+        }
+    }
+}
+
 /// A link's messages on a channel of their own.
 fn link_reader(mut rx: link::Receiver) -> mpsc::Receiver<Msg> {
     let (s, r) = mpsc::channel();
@@ -2097,7 +2109,7 @@ fn held_back_shares_sent_again_after_a_drop_count_only_as_they_reach_the_gateway
     let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
 
     // link 1: hello, welcome, the first slice, one channel and its job
-    let lk = link::answer(l.accept().unwrap().0, hk).unwrap();
+    let lk = accept_link(&l, hk);
     let (tx, rx) = (lk.tx, link_reader(lk.rx));
     let Ok(Msg::Hello { rental, terms: t, .. }) = rx.recv_timeout(Duration::from_secs(5)) else { panic!("no hello") };
     tx.send(&Msg::Welcome { rental, terms_hash: hex::encode(t.hash()), proof: Some(PROOF.into()) }).unwrap();
@@ -2143,7 +2155,7 @@ fn held_back_shares_sent_again_after_a_drop_count_only_as_they_reach_the_gateway
     }
     // the drop, the renter's return, and all 40 sent as if lost with the link
     tx.shutdown();
-    let lk2 = link::answer(l.accept().unwrap().0, hk).unwrap();
+    let lk2 = accept_link(&l, hk);
     let (tx2, rx2) = (lk2.tx, link_reader(lk2.rx));
     let Ok(Msg::Resume { rental }) = rx2.recv_timeout(Duration::from_secs(10)) else { panic!("no resume") };
     tx2.send(&Msg::Welcome { rental, terms_hash: hex::encode(terms.hash()), proof: Some(PROOF.into()) }).unwrap();
