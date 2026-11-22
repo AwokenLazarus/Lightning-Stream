@@ -64,8 +64,8 @@ impl App {
             "They are part of the data folder below, so a backup of the folder keeps them. Save the folder before you reinstall or throw this box away.",
             "Put the file back in the same place in the data folder, then start the app again."));
         b.push_str(&item("The wallet's own files", &encrypted_pill,
-            "Your spending rules, the sealed keys for the money on this box, the channel book and the records. They are encrypted, and the backup is locked with a passphrase you choose.",
-            "The rules and the records are gone. Money held on this box, and the ticket history that makes you the same buyer at every shop, would be lost too.",
+            "Your spending rules, the app's own sealed keys, the channel book and the records. They are encrypted, and the backup is locked with a passphrase you choose.",
+            "The rules and the records are gone, and so is the ticket history that makes you the same buyer at every shop. Your coins are not in these files: they stay on your Lightning node.",
             "On <a href=\"./keys\">Keys and backup</a>, use <em>Sign and download the backup</em>. The data folder below holds the same files.",
             "This app has no restore button for that file. Restoring it takes help: put the files back under the wallet's folder and open the sealed key with the passphrase. \
              A platform backup (Umbrel, StartOS) or a copy of the data folder brings it all back at once."));
